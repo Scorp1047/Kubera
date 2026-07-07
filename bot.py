@@ -2036,15 +2036,15 @@ async def monitor_positions(send_telegram=None, dry_run: bool = False):
             if result['action'] == 'closed':
                 emoji = '✅' if 'profit' in reason else '🛑'
                 msg = (
-                    f"{emoji} CLOSED: {symbol} ({strategy})\n"
+                    f"{emoji} CLOSED: *{symbol}* `{strategy}`\n"
                     f"Reason: {reason}\n"
                     f"Value: ${value:.4f} | P&L ≈ ${pnl_a:+.2f}"
                     + (f" | DTE: {dte}" if dte is not None else "")
-                    + ('\n(dry_run — not executed on TT)' if effective_dry_run else '')
+                    + ('\n_(dry_run — not executed on TT)_' if effective_dry_run else '')
                 )
             else:
                 msg = (
-                    f"⚠️ ALERT: {symbol} ({strategy})\n"
+                    f"⚠️ ALERT: *{symbol}* `{strategy}`\n"
                     f"{reason}"
                     + (f" | POP: {pop:.1f}%" if pop else "")
                     + (f" | DTE: {dte}" if dte is not None else "")
@@ -2346,8 +2346,10 @@ async def _place_order(order: dict, dry_run: bool = True) -> dict | None:
         elif strategy == 'iron_condor':
             return await tt.tt_place_iron_condor(
                 symbol=symbol, expiry=expiry,
-                sell_put=order['sell_put'],   buy_put=order['buy_put'],
-                sell_call=order['sell_call'], buy_call=order['buy_call'],
+                sell_put=order.get('put_sell_strike')  or order.get('sell_put',  0),
+                buy_put=order.get('put_buy_strike')    or order.get('buy_put',   0),
+                sell_call=order.get('call_sell_strike') or order.get('sell_call', 0),
+                buy_call=order.get('call_buy_strike')   or order.get('buy_call',  0),
                 total_credit=order['credit'],
                 contracts=contracts, dry_run=dry_run,
             )
@@ -2355,8 +2357,9 @@ async def _place_order(order: dict, dry_run: bool = True) -> dict | None:
         elif strategy == 'jade_lizard':
             return await tt.tt_place_jade_lizard(
                 symbol=symbol, expiry=expiry,
-                sell_put=order['sell_put'],
-                sell_call=order['sell_call'], buy_call=order['buy_call'],
+                sell_put=order.get('put_sell_strike')   or order.get('sell_put',   0),
+                sell_call=order.get('call_sell_strike') or order.get('sell_call',  0),
+                buy_call=order.get('call_buy_strike')   or order.get('buy_call',   0),
                 total_credit=order['credit'],
                 contracts=contracts, dry_run=dry_run,
             )
@@ -2377,7 +2380,8 @@ async def _place_order(order: dict, dry_run: bool = True) -> dict | None:
             return await tt.tt_place_calendar_spread(
                 symbol=symbol,
                 near_expiry=near_expiry, far_expiry=far_expiry,
-                strike=order['strike'], option_type=opt_type, debit=order['debit'],
+                strike=order.get('atm_strike') or order.get('strike', 0),
+                option_type=opt_type, debit=order['debit'],
                 contracts=contracts, dry_run=dry_run,
             )
 
@@ -2393,11 +2397,13 @@ async def _place_order(order: dict, dry_run: bool = True) -> dict | None:
 def _build_record_kwargs(order: dict, signal: dict, data: dict) -> dict:
     strategy = order.get('strategy', '')
     s = dict(signal)
-    s['sell_strike']     = order.get('sell_strike') or order.get('sell_put')
-    s['buy_strike']      = order.get('buy_strike')  or order.get('buy_call')
-    s['sell_strike_put'] = order.get('sell_put')
-    s['buy_strike_put']  = order.get('buy_put')
-    s['sell_call']       = order.get('sell_call')
+    s['sell_strike']     = (order.get('sell_strike') or order.get('call_sell_strike')
+                            or order.get('sell_put') or order.get('put_sell_strike'))
+    s['buy_strike']      = (order.get('buy_strike') or order.get('call_buy_strike')
+                            or order.get('buy_call') or order.get('put_buy_strike'))
+    s['sell_strike_put'] = order.get('put_sell_strike') or order.get('sell_put')
+    s['buy_strike_put']  = order.get('put_buy_strike')  or order.get('buy_put')
+    s['sell_call']       = order.get('call_sell_strike') or order.get('sell_call')
     s['near_expiry']     = order.get('near_expiry')
     s['far_expiry']      = order.get('far_expiry')
     s['expiry']          = order.get('expiry')
@@ -2443,7 +2449,7 @@ async def _execute_signal(order: dict, signal: dict, data: dict,
     if not result or result.get('status') == 'FAILED' or result.get('error'):
         err = result.get('error', 'unknown') if result else 'placement returned None'
         log.error(f'Order failed: {symbol} {strategy} — {err}')
-        await tg(f'❌ Order failed: *{symbol}* {strategy}\n{err}')
+        await tg(f'❌ Order failed: *{symbol}* `{strategy}`\n{err}')
         return False
 
     order_id = result.get('order_id')
@@ -2462,10 +2468,10 @@ async def _execute_signal(order: dict, signal: dict, data: dict,
     credit_str = f'{"debit" if is_debit else "credit"}=${cr:.2f}'
 
     await tg(
-        f'📋 *{symbol}* {strategy} x{contracts}\n'
+        f'📋 *{symbol}* `{strategy}` x{contracts}\n'
         f'{credit_str} | expiry={order.get("expiry")} | id={trade_id}\n'
         f'Order: {order_id} status={status}'
-        + ('\n*(dry_run — not live)*' if dry_run else '')
+        + ('\n_(dry_run — not live)_' if dry_run else '')
     )
 
     if not dry_run and order_id:
