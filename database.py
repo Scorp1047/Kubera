@@ -534,7 +534,7 @@ def symbols_today() -> set:
 
 def check_guardrails():
     """Returns (can_trade: bool, reason: str). Call at start of every scan."""
-    from config import MAX_CAPITAL_DEPLOYED_PCT
+    from config import MAX_CAPITAL_DEPLOYED
     now     = datetime.now(ET)
     balance = get_current_balance()
 
@@ -544,11 +544,11 @@ def check_guardrails():
 
     # Capital deployment ceiling
     deployed = get_deployed_capital()
-    if balance > 0 and (deployed / balance) >= MAX_CAPITAL_DEPLOYED_PCT:
+    if balance > 0 and (deployed / balance) >= MAX_CAPITAL_DEPLOYED:
         pct = deployed / balance * 100
         return False, (f'CAPITAL CEILING: {pct:.1f}% deployed '
                        f'(${deployed:,.0f} / ${balance:,.0f}) — '
-                       f'ceiling {MAX_CAPITAL_DEPLOYED_PCT*100:.0f}%')
+                       f'ceiling {MAX_CAPITAL_DEPLOYED*100:.0f}%')
 
     # Manual pause
     if get_state('paused') == 'true':
