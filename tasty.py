@@ -626,10 +626,34 @@ async def tt_place_calendar_spread(symbol: str,
             log.error(msg)
             return {'error': msg, 'status': 'FAILED'}
 
+        # Compute actual debit from real bid/ask — the estimate (price * 0.015) is
+        # wildly wrong for low-IV ETFs (e.g. TLT: estimate $1.27, real $0.37;
+        # HYG: estimate $1.20, real $0.10). TT rejects orders far outside market.
+        order_debit = debit  # fallback to passed estimate if greeks fetch fails
+        try:
+            greeks = await tt_get_greeks_for_options([near_opt, far_opt])
+            near_d = greeks.get(near_opt.symbol, {})
+            far_d  = greeks.get(far_opt.symbol,  {})
+            near_bid = near_d.get('bid', 0)
+            near_ask = near_d.get('ask', 0)
+            far_bid  = far_d.get('bid',  0)
+            far_ask  = far_d.get('ask',  0)
+            if near_bid > 0 and far_ask > 0:
+                near_mid    = round((near_bid + near_ask) / 2, 2)
+                far_mid     = round((far_bid  + far_ask)  / 2, 2)
+                order_debit = max(round(far_mid - near_mid, 2), 0.01)
+                log.info(f'Calendar {symbol}: real debit=${order_debit:.2f} '
+                         f'(near_mid={near_mid:.2f} far_mid={far_mid:.2f}) '
+                         f'vs estimate=${debit:.2f}')
+            else:
+                log.warning(f'Calendar {symbol}: greeks missing bid/ask — using estimate ${debit:.2f}')
+        except Exception as _e:
+            log.warning(f'Calendar {symbol}: greeks fetch failed ({_e!s:.60}) — using estimate ${debit:.2f}')
+
         order = NewOrder(
             time_in_force=OrderTimeInForce.DAY,
             order_type=OrderType.LIMIT,
-            price=Decimal(str(round(debit, 2))),
+            price=Decimal(str(order_debit)),
             price_effect=PriceEffect.DEBIT,
             legs=[
                 near_opt.build_leg(contracts, OrderAction.SELL_TO_OPEN),  # short near leg
@@ -639,7 +663,7 @@ async def tt_place_calendar_spread(symbol: str,
         response = await TT_ACCOUNT.place_order(TT_SESSION, order, dry_run=dry_run)
         placed   = response.order
         log.info(f'Calendar spread placed: {symbol} {option_type} @ {strike} | '
-                 f'near={near_expiry} far={far_expiry} @ {debit} debit x{contracts} | '
+                 f'near={near_expiry} far={far_expiry} @ {order_debit} debit x{contracts} | '
                  f'dry_run={dry_run} | status={placed.status}')
         return {
             'order_id':    getattr(placed, 'id', None),
