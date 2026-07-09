@@ -2404,7 +2404,7 @@ async def _place_order(order: dict, dry_run: bool = True) -> dict | None:
                 symbol=symbol,
                 near_expiry=near_expiry, far_expiry=far_expiry,
                 strike=order.get('atm_strike') or order.get('strike', 0),
-                option_type=opt_type, debit=order['debit'],
+                option_type=opt_type, debit=order.get('est_debit') or order.get('debit', 0),
                 contracts=contracts, dry_run=dry_run,
             )
 
@@ -2441,7 +2441,7 @@ def _build_record_kwargs(order: dict, signal: dict, data: dict) -> dict:
 
     is_debit = 'debit' in strategy or 'calendar' in strategy
     if is_debit:
-        s['credit_debit'] = -abs(float(order.get('debit') or 0))
+        s['credit_debit'] = -abs(float(order.get('est_debit') or order.get('debit') or 0))
     else:
         s['credit_debit'] = abs(float(order.get('credit') or 0))
 
