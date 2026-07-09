@@ -161,6 +161,9 @@ BIAS_SKEW_NEUTRAL_LOW  = 0.95   # below this threshold: call IV unusually rich �
 # ═══════════════════════════════════════════════════════════════════
 
 MAX_BPR_PCT            = 0.05   # max buying power reduction per trade = 5% of NLV
+MIN_BPR_GATE_PCT       = 0.15   # skip symbol if 1-contract BPR > 15% of NLV
+                                 # catches MSFT/META/BA where 10-wide spread = $800–1,200 BPR
+                                 # at 5% target ($287), flooring to 1 would deploy 3× the cap
 MAX_POSITIONS          = 10     # maximum concurrent open positions
 MAX_SECTOR_POSITIONS   = 3      # maximum positions in the same sector simultaneously
 PORTFOLIO_THETA_TARGET = 0.001  # target: 0.1% of NLV per day in portfolio theta

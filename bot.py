@@ -41,7 +41,7 @@ from config import (
     ETF_SYMBOLS, STOCK_SYMBOLS, SECTOR_MAP,
     TARGET_DELTA, MIN_POP,
     JADE_MIN_CREDIT_RATIO, IC_CREDIT_RATIO, IC_MAX_IVR,
-    MAX_BPR_PCT, EARNINGS_BLOCK,
+    MAX_BPR_PCT, MIN_BPR_GATE_PCT, EARNINGS_BLOCK,
     SAFE_HAVEN_SYMBOLS, BLOCKED_SYMBOLS,
     ROLL_POP_FLOOR,
 )
@@ -776,16 +776,27 @@ def validate_entry(data, strategy, sub_type, earnings_cache, open_positions):
 # ── Position Sizing ────────────────────────────────────────────────
 
 def calculate_size(balance, bpr_per_contract):
-    """Flat BPR sizing: 5% of NLV per trade. Minimum 1 contract."""
+    """Flat BPR sizing: 5% of NLV per trade. Minimum 1 contract.
+    Returns 0 if 1 contract BPR exceeds MIN_BPR_GATE_PCT of balance —
+    symbol is too expensive for the account size."""
     if bpr_per_contract <= 0:
         return 1
-    max_bpr   = balance * MAX_BPR_PCT
-    contracts = max(1, int(max_bpr / bpr_per_contract))
+    max_bpr       = balance * MAX_BPR_PCT
+    contracts_raw = int(max_bpr / bpr_per_contract)
+    if contracts_raw == 0:
+        gate = balance * MIN_BPR_GATE_PCT
+        if bpr_per_contract > gate:
+            log.info(
+                f'BPR gate: 1-contract BPR ${bpr_per_contract:.0f} '
+                f'> {MIN_BPR_GATE_PCT*100:.0f}% of balance (${gate:.0f}) — symbol too expensive, skip'
+            )
+            return 0
+        contracts_raw = 1  # affordable at 1 contract (between 5%–15% of balance)
     log.info(
         f'Sizing: ${balance:.0f} × {MAX_BPR_PCT*100:.0f}% = '
-        f'${max_bpr:.0f} / ${bpr_per_contract:.0f} per ct = {contracts} ct'
+        f'${max_bpr:.0f} / ${bpr_per_contract:.0f} per ct = {contracts_raw} ct'
     )
-    return contracts
+    return contracts_raw
 
 
 # ── Signal Builder ─────────────────────────────────────────────────
@@ -836,6 +847,8 @@ def build_signal(data, strategy, sub_type, balance, call_spread_width=5.0):
 
         bpr_per_contract = (wing_width - put_credit) * 100
         contracts        = calculate_size(balance, bpr_per_contract)
+        if contracts == 0:
+            return None
         max_loss         = round(bpr_per_contract * contracts, 2)
         profit_target    = round(put_credit * PROFIT_TARGET_CREDIT, 2)
         loss_stop        = round(put_credit * LOSS_STOP_MULTIPLIER, 2)
@@ -862,6 +875,8 @@ def build_signal(data, strategy, sub_type, balance, call_spread_width=5.0):
                 total_credit = round(put_credit + call_credit, 2)
                 bpr_per_contract = (wing_width - total_credit) * 100
                 contracts        = calculate_size(balance, bpr_per_contract)
+                if contracts == 0:
+                    return None
                 max_loss         = round(bpr_per_contract * contracts, 2)
                 profit_target    = round(total_credit * PROFIT_TARGET_CREDIT, 2)
                 loss_stop        = round(total_credit * LOSS_STOP_MULTIPLIER, 2)
@@ -893,6 +908,8 @@ def build_signal(data, strategy, sub_type, balance, call_spread_width=5.0):
             total_credit = round(put_credit + call_credit, 2)
             bpr_per_contract = (wing_width - put_credit) * 100
             contracts        = calculate_size(balance, bpr_per_contract)
+            if contracts == 0:
+                return None
             max_loss         = round(bpr_per_contract * contracts, 2)
             profit_target    = round(total_credit * PROFIT_TARGET_CREDIT, 2)
             loss_stop        = round(total_credit * LOSS_STOP_MULTIPLIER, 2)
@@ -926,6 +943,8 @@ def build_signal(data, strategy, sub_type, balance, call_spread_width=5.0):
 
         bpr_per_contract = (wing_width - call_credit) * 100
         contracts        = calculate_size(balance, bpr_per_contract)
+        if contracts == 0:
+            return None
         max_loss         = round(bpr_per_contract * contracts, 2)
         profit_target    = round(call_credit * PROFIT_TARGET_CREDIT, 2)
         loss_stop        = round(call_credit * LOSS_STOP_MULTIPLIER, 2)
@@ -952,6 +971,8 @@ def build_signal(data, strategy, sub_type, balance, call_spread_width=5.0):
         est_debit        = round(price * 0.02, 2)
         bpr_per_contract = est_debit * 100
         contracts        = calculate_size(balance, bpr_per_contract)
+        if contracts == 0:
+            return None
         max_loss         = round(bpr_per_contract * contracts, 2)
         sig.update({
             'anchor_strike':     leg.get('strike', 0.0),
@@ -969,6 +990,8 @@ def build_signal(data, strategy, sub_type, balance, call_spread_width=5.0):
         est_debit        = round(price * 0.015, 2)
         bpr_per_contract = est_debit * 100
         contracts        = calculate_size(balance, bpr_per_contract)
+        if contracts == 0:
+            return None
         max_loss         = round(bpr_per_contract * contracts, 2)
         sig.update({
             'est_debit':         est_debit,
@@ -2665,6 +2688,14 @@ async def run_scan():
             order = build_order(data, signal)
             if order is None or order.get('error'):
                 log.info(f'SKIP {symbol}: build_order failed — {order.get("error") if order else "None"}')
+                skipped += 1
+                continue
+
+            # Re-check capital ceiling immediately before execution —
+            # earlier placements in this same scan cycle may have consumed headroom.
+            can_trade_now, guard_now = db.check_guardrails()
+            if not can_trade_now:
+                log.info(f'SKIP {symbol}: capital ceiling hit mid-scan — {guard_now}')
                 skipped += 1
                 continue
 
