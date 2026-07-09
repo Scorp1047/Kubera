@@ -2487,7 +2487,7 @@ async def _execute_signal(order: dict, signal: dict, data: dict,
         trade_id = None
 
     is_debit  = 'debit' in strategy or 'calendar' in strategy
-    cr        = float(order.get('credit') or order.get('debit') or 0)
+    cr        = float(order.get('credit') or order.get('est_debit') or order.get('debit') or 0)
     credit_str = f'{"debit" if is_debit else "credit"}=${cr:.2f}'
 
     await tg(
@@ -2690,6 +2690,21 @@ async def run_scan():
                 log.info(f'SKIP {symbol}: build_order failed — {order.get("error") if order else "None"}')
                 skipped += 1
                 continue
+
+            # Calendar spread: populate near/far expiry from data + far_list into order.
+            # build_calendar_spread() omits expiry fields; _place_order() needs them.
+            if strategy == 'calendar_spread':
+                near_str = str(data.get('expiry', ''))
+                far_list_resolved = signal.get('_cal_far_expiry_list', [])
+                if not far_list_resolved:
+                    log.info(f'SKIP {symbol}: calendar far_list empty after build_order')
+                    skipped += 1
+                    continue
+                far_str = far_list_resolved[0][0]   # (expiry_str, dte, options) tuple
+                order['near_expiry'] = near_str
+                order['far_expiry']  = far_str
+                order['expiry']      = near_str
+                order['dte']         = data.get('dte', 0)
 
             # Re-check capital ceiling immediately before execution —
             # earlier placements in this same scan cycle may have consumed headroom.
