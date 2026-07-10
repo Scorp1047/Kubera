@@ -2178,37 +2178,117 @@ async def cmd_positions(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text('No open positions.')
         return
 
+    _strat_label = {
+        'iron_condor':        'Iron Condor',
+        'put_credit_spread':  'Put Credit Spread',
+        'call_credit_spread': 'Call Credit Spread',
+        'jade_lizard':        'Jade Lizard',
+        'debit_spread':       'Debit Spread',
+        'calendar_spread':    'Calendar Spread',
+    }
+
     today = date.today()
-    lines = ['*Open Positions*\n']
+    lines = [f'<b>Open Positions ({len(trades)})</b>']
+
     for t in trades:
         t = dict(t)
-        expiry_s = t.get('expiry') or t.get('far_expiry', '?')
+        strategy = t.get('strategy', '?')
+        symbol   = t.get('symbol', '?')
+        strat    = _strat_label.get(strategy, strategy)
+        cts      = int(t.get('contracts') or 1)
+
+        # DTE
+        expiry_s = t.get('expiry') or t.get('near_expiry') or t.get('far_expiry', '?')
         try:
-            exp = date.fromisoformat(expiry_s)
-            dte = (exp - today).days
+            dte = (date.fromisoformat(expiry_s) - today).days
         except Exception:
             dte = '?'
 
-        cr = float(t.get('credit_debit') or 0)
+        # Credit / debit at entry
+        cr       = float(t.get('credit_debit') or 0)
         is_debit = cr < 0
-        cr_label = f'debit=${abs(cr):.2f}' if is_debit else f'credit=${cr:.2f}'
+        entry    = abs(cr)
 
-        stop   = t.get('stop_value')
-        target = t.get('target_value')
-        mgmt   = ''
-        if stop and target:
-            mgmt = f' | tp={target:.2f} sl={stop:.2f}'
+        # Current value and P&L
+        cur_val  = t.get('last_spread_value')
+        if cur_val is not None:
+            cur_val = float(cur_val)
+            if is_debit:
+                pnl_per = cur_val - entry          # debit: profit = value rose
+            else:
+                pnl_per = entry - cur_val          # credit: profit = value fell
+            pnl_usd = round(pnl_per * 100 * cts, 2)
+            pnl_pct = round(pnl_per / entry * 100, 1) if entry else 0
+            pnl_sign = '+' if pnl_usd >= 0 else ''
+            pnl_str  = f'{pnl_sign}${pnl_usd:.2f} ({pnl_sign}{pnl_pct:.1f}%)'
+            val_str  = f'${cur_val:.2f}'
+        else:
+            pnl_str = 'n/a'
+            val_str = 'n/a'
 
-        last_val = t.get('last_spread_value')
-        val_str  = f' | val=${last_val:.4f}' if last_val else ''
+        # Spot price (from last monitor cycle)
+        spot = t.get('last_spot_price') or t.get('spot_price')
+        spot_str = f'${float(spot):.2f}' if spot else 'n/a'
 
-        lines.append(
-            f'#{t["id"]} *{t.get("symbol","?")}* {t.get("strategy","?")} x{t.get("contracts",1)}\n'
-            f'{cr_label} | DTE={dte} | IVR={t.get("ivr","?")} bias={t.get("bias","?")}'
-            f'{mgmt}{val_str}'
-        )
+        # Strike structure + distance to short strike
+        sell_put  = t.get('sell_strike_put')
+        buy_put   = t.get('buy_strike_put')
+        sell_call = t.get('sell_call') or t.get('sell_strike')
+        buy_call  = t.get('buy_strike')
 
-    await update.message.reply_text('\n\n'.join(lines), parse_mode='Markdown')
+        if strategy == 'iron_condor' and sell_put and sell_call:
+            strikes_str = f'P {buy_put:.0f}/{sell_put:.0f} | C {sell_call:.0f}/{buy_call:.0f}'
+            if spot:
+                s = float(spot)
+                dist_put  = round(s - float(sell_put),  2)
+                dist_call = round(float(sell_call) - s, 2)
+                dist_str  = f'dist: {dist_put:+.2f} to put short, {dist_call:+.2f} to call short'
+            else:
+                dist_str = ''
+        elif strategy in ('call_credit_spread',) and sell_call:
+            strikes_str = f'C {sell_call:.0f}/{buy_call:.0f}'
+            if spot:
+                dist_str = f'dist: {round(float(sell_call) - float(spot), 2):+.2f} to short strike'
+            else:
+                dist_str = ''
+        elif strategy in ('put_credit_spread', 'jade_lizard') and t.get('sell_strike'):
+            sp = float(t['sell_strike'])
+            bp = float(t.get('buy_strike') or 0)
+            strikes_str = f'P {bp:.0f}/{sp:.0f}'
+            if sell_call:
+                strikes_str += f' | C {sell_call:.0f}'
+            if spot:
+                dist_str = f'dist: {round(float(spot) - sp, 2):+.2f} to short strike'
+            else:
+                dist_str = ''
+        elif strategy == 'calendar_spread':
+            atm = t.get('sell_strike') or t.get('buy_strike')
+            strikes_str = f'ATM {atm:.0f}' if atm else ''
+            dist_str = ''
+        else:
+            strikes_str = ''
+            dist_str = ''
+
+        # TP / SL
+        tp = t.get('target_value')
+        sl = t.get('stop_value')
+        tp_sl = f'TP ${tp:.2f} | SL ${sl:.2f}' if tp and sl else ''
+
+        # Assemble block (HTML — no markdown italic issues)
+        block  = f'\n<b>#{t["id"]} {symbol} — {strat} x{cts}</b>\n'
+        block += f'Spot: {spot_str} | DTE: {dte} | IVR: {t.get("ivr","?")} | Bias: {t.get("bias","?")}\n'
+        if strikes_str:
+            block += f'Strikes: {strikes_str}\n'
+        if dist_str:
+            block += f'{dist_str}\n'
+        cr_label = 'Debit' if is_debit else 'Credit'
+        block += f'{cr_label}: ${entry:.2f} | Val: {val_str} | P&L: {pnl_str}\n'
+        if tp_sl:
+            block += tp_sl
+
+        lines.append(block)
+
+    await update.message.reply_text('\n'.join(lines), parse_mode='HTML')
 
 
 async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
