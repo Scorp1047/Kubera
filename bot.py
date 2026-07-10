@@ -2269,10 +2269,15 @@ async def cmd_positions(update: Update, context: ContextTypes.DEFAULT_TYPE):
             strikes_str = ''
             dist_str = ''
 
-        # TP / SL
+        # TP / SL — show close value and resulting dollar P&L at each level
         tp = t.get('target_value')
         sl = t.get('stop_value')
-        tp_sl = f'TP ${tp:.2f} | SL ${sl:.2f}' if tp and sl else ''
+        if tp and sl and entry:
+            tp_profit = round((entry - float(tp)) * 100 * cts, 2) if not is_debit else round((float(tp) - entry) * 100 * cts, 2)
+            sl_loss   = round((entry - float(sl)) * 100 * cts, 2) if not is_debit else round((float(sl) - entry) * 100 * cts, 2)
+            tp_sl = f'Take profit: close @ ${float(tp):.2f} = +${tp_profit:.0f}\nStop loss:   close @ ${float(sl):.2f} = ${sl_loss:.0f}'
+        else:
+            tp_sl = ''
 
         # Assemble block (HTML — no markdown italic issues)
         block  = f'\n<b>#{t["id"]} {symbol} — {strat} x{cts}</b>\n'
