@@ -694,6 +694,10 @@ def validate_entry(data, strategy, sub_type, earnings_cache, open_positions):
     ivr     = data.get('ivr', 0)
     failures = []
 
+    if any(p.get('symbol') == symbol and p.get('status') == 'open' for p in open_positions):
+        failures.append(f'{symbol} already has an open position')
+        return False, failures
+
     if symbol in BLOCKED_SYMBOLS:
         failures.append(f'{symbol} is permanently blocked')
         return False, failures
