@@ -2472,7 +2472,8 @@ async def _execute_signal(order: dict, signal: dict, data: dict,
     if not result or result.get('status') == 'FAILED' or result.get('error'):
         err = result.get('error', 'unknown') if result else 'placement returned None'
         log.error(f'Order failed: {symbol} {strategy} — {err}')
-        await tg(f'❌ Order failed: *{symbol}* `{strategy}`\n{err}')
+        err_safe = err.replace('`', "'")  # strip backticks — break TG markdown
+        await tg(f'❌ Order failed: *{symbol}* `{strategy}`\n{err_safe}')
         return False
 
     order_id = result.get('order_id')

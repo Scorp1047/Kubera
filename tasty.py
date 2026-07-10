@@ -591,19 +591,27 @@ async def tt_place_calendar_spread(symbol: str,
     near_expiry: the short (sold) expiry — collects theta faster
     far_expiry:  the long (bought) expiry — long vega, profits from IV expansion"""
     try:
+        # Fix 1: guard against None expiries — causes 'datetime.date - NoneType' crash
+        if near_expiry is None or far_expiry is None:
+            msg = f'Calendar: near_expiry={near_expiry} far_expiry={far_expiry} — one is None'
+            log.error(msg)
+            return {'error': msg, 'status': 'FAILED'}
+
         await _tt_guard()
         chain = await get_option_chain(TT_SESSION, symbol)
         opt_type = option_type.upper()[0]
 
         # Resolve near expiry
+        _near = near_expiry  # snapshot for lambda — avoids closure rebind confusion
         if near_expiry not in chain:
             available = sorted(chain.keys())
-            near_expiry = min(available, key=lambda d: abs((d - near_expiry).days))
+            near_expiry = min(available, key=lambda d: abs((d - _near).days))
             log.warning(f'Calendar near expiry adjusted to: {near_expiry}')
         # Resolve far expiry
+        _far = far_expiry
         if far_expiry not in chain:
             available = sorted(chain.keys())
-            far_expiry = min(available, key=lambda d: abs((d - far_expiry).days))
+            far_expiry = min(available, key=lambda d: abs((d - _far).days))
             log.warning(f'Calendar far expiry adjusted to: {far_expiry}')
 
         if near_expiry >= far_expiry:
@@ -629,7 +637,9 @@ async def tt_place_calendar_spread(symbol: str,
         # Compute actual debit from real bid/ask — the estimate (price * 0.015) is
         # wildly wrong for low-IV ETFs (e.g. TLT: estimate $1.27, real $0.37;
         # HYG: estimate $1.20, real $0.10). TT rejects orders far outside market.
-        order_debit = debit  # fallback to passed estimate if greeks fetch fails
+        # Fix 2: if greeks unavailable, SKIP rather than send bad estimate to TT.
+        greeks_ok = False
+        order_debit = None
         try:
             greeks = await tt_get_greeks_for_options([near_opt, far_opt])
             near_d = greeks.get(near_opt.symbol, {})
@@ -642,13 +652,19 @@ async def tt_place_calendar_spread(symbol: str,
                 near_mid    = round((near_bid + near_ask) / 2, 2)
                 far_mid     = round((far_bid  + far_ask)  / 2, 2)
                 order_debit = max(round(far_mid - near_mid, 2), 0.01)
+                greeks_ok   = True
                 log.info(f'Calendar {symbol}: real debit=${order_debit:.2f} '
                          f'(near_mid={near_mid:.2f} far_mid={far_mid:.2f}) '
                          f'vs estimate=${debit:.2f}')
             else:
-                log.warning(f'Calendar {symbol}: greeks missing bid/ask — using estimate ${debit:.2f}')
+                log.warning(f'Calendar {symbol}: greeks missing bid/ask (near_bid={near_bid} far_ask={far_ask}) — skipping')
         except Exception as _e:
-            log.warning(f'Calendar {symbol}: greeks fetch failed ({_e!s:.60}) — using estimate ${debit:.2f}')
+            log.warning(f'Calendar {symbol}: greeks fetch failed ({_e!s:.60}) — skipping')
+
+        if not greeks_ok:
+            msg = f'Calendar {symbol}: no reliable bid/ask — cannot price order safely'
+            log.error(msg)
+            return {'error': msg, 'status': 'FAILED'}
 
         order = NewOrder(
             time_in_force=OrderTimeInForce.DAY,
@@ -678,7 +694,7 @@ async def tt_place_calendar_spread(symbol: str,
             'dry_run':     dry_run,
         }
     except Exception as e:
-        log.error(f'Calendar spread placement failed: {e}')
+        log.error(f'Calendar spread placement failed: {e}', exc_info=True)
         return {'error': str(e), 'status': 'FAILED'}
 
 
