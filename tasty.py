@@ -651,7 +651,9 @@ async def tt_place_calendar_spread(symbol: str,
             if near_bid > 0 and far_ask > 0:
                 near_mid    = round((near_bid + near_ask) / 2, 2)
                 far_mid     = round((far_bid  + far_ask)  / 2, 2)
-                order_debit = max(round(far_mid - near_mid, 2), 0.01)
+                raw_debit   = max(round(far_mid - near_mid, 2), 0.01)
+                # Round to nearest $0.05 tick — TT rejects multi-leg DEBIT orders at arbitrary decimals
+                order_debit = max(0.05, round(round(raw_debit / 0.05) * 0.05, 2))
                 greeks_ok   = True
                 log.info(f'Calendar {symbol}: real debit=${order_debit:.2f} '
                          f'(near_mid={near_mid:.2f} far_mid={far_mid:.2f}) '
@@ -734,10 +736,12 @@ async def tt_close_calendar_spread(symbol: str,
             log.error(msg)
             return {'error': msg, 'status': 'FAILED'}
 
+        # Round to nearest $0.05 tick — TT rejects multi-leg CREDIT orders at arbitrary decimals
+        _credit_tick = max(0.05, round(round(credit / 0.05) * 0.05, 2))
         order = NewOrder(
             time_in_force=OrderTimeInForce.DAY,
             order_type=OrderType.LIMIT,
-            price=Decimal(str(round(credit, 2))),
+            price=Decimal(str(_credit_tick)),
             price_effect=PriceEffect.CREDIT,
             legs=[
                 near_opt.build_leg(contracts, OrderAction.BUY_TO_CLOSE),   # buy back short near

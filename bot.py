@@ -1842,6 +1842,8 @@ async def _monitor_one(trade, vix=None, dry_run: bool = False) -> dict:
         'pop':           None,
         'dte_remaining': None,
         'alert':         False,
+        'credit_debit':  float(trade.get('credit_debit') or 0),
+        'contracts':     int(trade.get('contracts') or 1),
     }
 
     symbol    = trade['symbol']
@@ -1894,6 +1896,9 @@ async def _monitor_one(trade, vix=None, dry_run: bool = False) -> dict:
             db.update_trade_last_spot(trade['id'], spot)
     except Exception:
         spot = trade.get('last_spot_price') or float(trade.get('spot_price') or 0) or None
+
+    result['spot']  = spot
+    result['trade'] = dict(trade)
 
     # DTE EXIT (21 DTE)
     dte_exit = int(DTE_EXIT)
@@ -2119,18 +2124,34 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _authed(update):
         return await _deny(update)
     await update.message.reply_text(
-        '*Kubera — TastyTrade Options Bot*\n\n'
-        'Commands:\n'
-        '/status — bot state + guardrails\n'
-        '/positions — open positions\n'
-        '/balance — fetch live TT NLV\n'
-        '/scan — trigger manual scan\n'
-        '/pause — halt new entries\n'
-        '/resume — re-enable entries\n'
-        '/mode [paper|live] — show/set mode\n'
-        '/monitor — run monitor cycle now\n'
-        '/history — closed trade summary',
+        '*Kubera online.* Type /help for command list.',
         parse_mode='Markdown'
+    )
+
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _authed(update):
+        return await _deny(update)
+    await update.message.reply_text(
+        'KUBERA COMMANDS\n\n'
+        'TRADING\n'
+        '/scan      — trigger manual scan\n'
+        '/monitor   — run monitor cycle now\n\n'
+        'POSITIONS\n'
+        '/positions — open positions + P&L\n'
+        '/history   — closed trade summary\n\n'
+        'ACCOUNT\n'
+        '/status    — bot state + guardrails\n'
+        '/balance   — fetch live TT NLV\n'
+        '/pause     — halt new entries\n'
+        '/resume    — re-enable entries\n'
+        '/mode      — show or set mode (paper/live)\n\n'
+        'EXIT RULES\n'
+        '25% profit  → auto close\n'
+        '50% loss    → hard stop\n'
+        '21 DTE      → time exit\n'
+        '2 con. losses → 24h pause\n'
+        '10% weekly drawdown → weekly pause'
     )
 
 
@@ -2357,14 +2378,183 @@ async def cmd_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+def _fmt_legs(trade: dict, strategy: str) -> str:
+    """Format strike legs for display."""
+    sp  = trade.get('sell_strike_put')
+    bp  = trade.get('buy_strike_put')
+    sc  = trade.get('sell_strike') or trade.get('sell_call')
+    bc  = trade.get('buy_strike')
+    near = trade.get('near_expiry', '')
+    far  = trade.get('far_expiry',  '')
+    def _s(v): return f'{float(v):.2f}'.rstrip('0').rstrip('.')
+    if strategy == 'iron_condor':
+        parts = []
+        if bp and sp: parts.append(f'{_s(bp)}P — {_s(sp)}P')
+        if sc and bc: parts.append(f'{_s(sc)}C — {_s(bc)}C')
+        return ' | '.join(parts)
+    elif strategy == 'put_credit_spread':
+        if sp and bc: return f'{_s(bc)}P — {_s(sp)}P'
+        if sp: return f'{_s(sp)}P short'
+    elif strategy == 'call_credit_spread':
+        if sc and bc: return f'{_s(sc)}C — {_s(bc)}C'
+    elif strategy == 'calendar_spread':
+        strike = sc or bc
+        try:
+            near_s = date.fromisoformat(near).strftime('%b %d') if near else '?'
+            far_s  = date.fromisoformat(far).strftime('%b %d')  if far  else '?'
+        except Exception:
+            near_s, far_s = near or '?', far or '?'
+        return f'{_s(strike)}C | near {near_s} / far {far_s}' if strike else f'near {near_s} / far {far_s}'
+    elif strategy == 'debit_spread':
+        direction = str(trade.get('direction', '')).lower()
+        opt = 'C' if 'call' in direction else 'P'
+        if bc and sc: return f'{_s(bc)}{opt} — {_s(sc)}{opt}'
+    elif strategy == 'jade_lizard':
+        parts = []
+        if sp: parts.append(f'{_s(sp)}P short')
+        if sc and bc: parts.append(f'{_s(sc)}C — {_s(bc)}C')
+        return ' | '.join(parts)
+    return ''
+
+
+def _fmt_position_block(r: dict) -> str:
+    """Build a full status block for one position from _monitor_one result."""
+    trade    = r.get('trade', {})
+    symbol   = r['symbol']
+    strategy = r['strategy']
+    action   = r['action']
+    is_debit = 'debit' in strategy or 'calendar' in strategy
+
+    strat_label = {
+        'iron_condor':        'Iron Condor',
+        'put_credit_spread':  'Put Credit Spread',
+        'call_credit_spread': 'Call Credit Spread',
+        'calendar_spread':    'Calendar Spread',
+        'debit_spread':       'Debit Spread',
+        'jade_lizard':        'Jade Lizard',
+    }.get(strategy, strategy.replace('_', ' ').title())
+
+    action_icon = {'closed': '✅', 'alert': '⚠️', 'hold': '🔵'}.get(action, '•')
+
+    # ── Expiry / DTE ──────────────────────────────────────
+    dte_now  = r.get('dte_remaining')
+    dte_open = trade.get('dte_at_open')
+    expiry_s = trade.get('near_expiry') or trade.get('expiry') or ''
+    try:
+        exp_fmt = date.fromisoformat(expiry_s).strftime('%b %d') if expiry_s else '?'
+    except Exception:
+        exp_fmt = expiry_s or '?'
+    dte_str = f'DTE {dte_now}' if dte_now is not None else 'DTE ?'
+    if dte_open: dte_str += f' (entered at {dte_open})'
+
+    # ── Entry economics ────────────────────────────────────
+    credit    = abs(float(trade.get('credit_debit') or 0))
+    max_loss  = float(trade.get('max_loss')      or 0)
+    capital   = float(trade.get('capital_used')  or 0)
+    contracts = int(trade.get('contracts')       or 1)
+    entry_lbl = 'paid' if is_debit else 'cr'
+
+    target_v  = float(trade.get('target_value') or 0)
+    stop_v    = float(trade.get('stop_value')   or 0)
+
+    # ── Current value / P&L ───────────────────────────────
+    value  = r.get('value')
+    pnl    = r.get('pnl_approx')
+    val_s  = f'${value:.2f}' if value is not None else 'no data'
+    if pnl is not None:
+        pnl_pct = (pnl / capital * 100) if capital else 0
+        sign    = '+' if pnl >= 0 else ''
+        pnl_s   = f'{sign}${pnl:.0f} ({sign}{pnl_pct:.1f}%)'
+    else:
+        pnl_s = 'N/A'
+
+    # ── Spot ──────────────────────────────────────────────
+    spot_now   = r.get('spot')
+    spot_entry = float(trade.get('spot_price') or 0)
+    if spot_entry and spot_now and abs(spot_now - spot_entry) > 0.01:
+        spot_s = f'${spot_entry:.2f} → ${spot_now:.2f}'
+    elif spot_now:
+        spot_s = f'${spot_now:.2f}'
+    elif spot_entry:
+        spot_s = f'${spot_entry:.2f} (entry)'
+    else:
+        spot_s = '?'
+
+    # ── Entry context ─────────────────────────────────────
+    ivr  = trade.get('ivr')
+    iv   = trade.get('avg_iv') or trade.get('entry_iv')
+    vix  = trade.get('vix_at_entry')
+    bias = trade.get('bias') or ''
+    pop  = r.get('pop')
+    opened_at = (trade.get('opened_at') or '')[:10]
+
+    # ── Legs ──────────────────────────────────────────────
+    legs = _fmt_legs(trade, strategy)
+
+    lines = [f'{action_icon} *{symbol}* — {strat_label}']
+    lines.append(f'Exp: {exp_fmt} | {dte_str}')
+    if legs:
+        lines.append(f'Legs: {legs}')
+    lines.append(f'Entry: {entry_lbl} ${credit:.2f} × {contracts}ct | Max loss: ${max_loss:.0f} | Capital: ${capital:.0f}')
+    if target_v and stop_v:
+        lines.append(f'Target: ${target_v:.2f} | Stop: ${stop_v:.2f}')
+    lines.append(f'Value: {val_s} | P&L: {pnl_s}')
+    lines.append(f'Spot: {spot_s}')
+
+    ctx = []
+    if ivr  is not None: ctx.append(f'IVR {ivr:.0f}%')
+    if iv   is not None: ctx.append(f'IV {iv:.1f}%')
+    if vix  is not None: ctx.append(f'VIX {vix:.1f}')
+    if pop  is not None: ctx.append(f'POP {pop:.0f}%')
+    if bias:             ctx.append(f'Bias {bias}')
+    if ctx: lines.append(' | '.join(ctx))
+    if opened_at: lines.append(f'Opened: {opened_at}')
+
+    if action in ('closed', 'alert') and r.get('reason'):
+        lines.append(f'↳ {r["reason"]}')
+
+    return '\n'.join(lines)
+
+
 async def cmd_monitor(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _authed(update):
         return await _deny(update)
-    await update.message.reply_text('🔄 Running manual monitor cycle...')
+    await update.message.reply_text('🔄 Running monitor cycle...')
     try:
-        await run_monitor()
+        results = await run_monitor()
+        now         = datetime.now(ET)
+        market_open = (9 <= now.hour < 16) or (now.hour == 16 and now.minute == 0)
+        mode        = db.get_state('mode') or 'paper'
+
+        if not results:
+            await update.message.reply_text('✅ Monitor complete — no open positions')
+            return
+
+        if mode != 'live':
+            mode_note = '_(paper mode — no live closes)_'
+        elif not market_open:
+            mode_note = '_(market closed — closes in dry-run)_'
+        else:
+            mode_note = ''
+
+        closed_n = sum(1 for r in results if r['action'] == 'closed')
+        alerts_n = sum(1 for r in results if r['action'] == 'alert')
+        header   = (f'📊 *Monitor — {len(results)} positions | '
+                    f'{closed_n} closed | {alerts_n} alerts*')
+        if mode_note:
+            header += f'\n{mode_note}'
+
+        # Send header then one message per position (avoids 4096-char TG limit)
+        await update.message.reply_text(header, parse_mode='Markdown')
+        for r in results:
+            try:
+                block = _fmt_position_block(r)
+                await update.message.reply_text(block, parse_mode='Markdown')
+            except Exception as _e:
+                await update.message.reply_text(
+                    f'⚠️ {r["symbol"]} — display error: {str(_e)[:80]}')
     except Exception as e:
-        await update.message.reply_text(f'Monitor error: {str(e)[:80]}')
+        await update.message.reply_text(f'Monitor error: {str(e)[:120]}')
 
 
 async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2831,18 +3021,34 @@ async def run_monitor():
     mode    = db.get_state('mode') or 'paper'
     dry_run = (mode != 'live')
     try:
-        await monitor_positions(send_telegram=tg, dry_run=dry_run)
+        results = await monitor_positions(send_telegram=tg, dry_run=dry_run)
+        return results or []
     except Exception as e:
         log.error(f'Monitor exception: {e}', exc_info=True)
         await tg(f'❌ Monitor error: {str(e)[:80]}')
+        return []
 
 
 # ── Application ─────────────────────────────────────────────────────
 
 async def post_init(application):
     """Called after Telegram Application starts. Connects TT, inits DB, starts scheduler."""
+    from telegram import BotCommand
     global _tg_bot
     _tg_bot = application.bot
+
+    await application.bot.set_my_commands([
+        BotCommand('scan',      'Trigger manual scan'),
+        BotCommand('monitor',   'Run monitor cycle now'),
+        BotCommand('positions', 'Open positions + P&L'),
+        BotCommand('history',   'Closed trade summary'),
+        BotCommand('status',    'Bot state + guardrails'),
+        BotCommand('balance',   'Fetch live TT NLV'),
+        BotCommand('pause',     'Halt new entries'),
+        BotCommand('resume',    'Re-enable entries'),
+        BotCommand('mode',      'Show or set mode (paper/live)'),
+        BotCommand('help',      'Command list'),
+    ])
 
     db.init_db()
     log.info('DB initialised')
@@ -2878,6 +3084,7 @@ def main():
     )
 
     app.add_handler(CommandHandler('start',     cmd_start))
+    app.add_handler(CommandHandler('help',      cmd_help))
     app.add_handler(CommandHandler('status',    cmd_status))
     app.add_handler(CommandHandler('positions', cmd_positions))
     app.add_handler(CommandHandler('balance',   cmd_balance))
