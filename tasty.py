@@ -489,11 +489,11 @@ async def tt_place_debit_spread(symbol: str, expiry: date,
             log.error(msg)
             return {'error': msg, 'status': 'FAILED'}
 
+        # TT SDK v12+: negative price → price-effect: Debit (DEBIT open orders need negative price)
         order = NewOrder(
             time_in_force=OrderTimeInForce.DAY,
             order_type=OrderType.LIMIT,
-            price=Decimal(str(round(debit, 2))),
-            price_effect=PriceEffect.DEBIT,
+            price=Decimal(str(-round(debit, 2))),   # negative → price-effect: Debit ✓
             legs=[
                 buy_opt.build_leg(contracts,  OrderAction.BUY_TO_OPEN),   # long leg (paid)
                 sell_opt.build_leg(contracts, OrderAction.SELL_TO_OPEN),  # short wing (offset)
@@ -668,11 +668,12 @@ async def tt_place_calendar_spread(symbol: str,
             log.error(msg)
             return {'error': msg, 'status': 'FAILED'}
 
+        # TT SDK v12+: price sign determines price-effect. Negative = Debit, positive = Credit.
+        # price_effect= parameter is silently ignored (computed field). Pass -debit for DEBIT orders.
         order = NewOrder(
             time_in_force=OrderTimeInForce.DAY,
             order_type=OrderType.LIMIT,
-            price=Decimal(str(order_debit)),
-            price_effect=PriceEffect.DEBIT,
+            price=Decimal(str(-order_debit)),   # negative → price-effect: Debit ✓
             legs=[
                 near_opt.build_leg(contracts, OrderAction.SELL_TO_OPEN),  # short near leg
                 far_opt.build_leg(contracts,  OrderAction.BUY_TO_OPEN),   # long far leg

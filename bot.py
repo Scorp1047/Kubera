@@ -2112,6 +2112,17 @@ async def tg(message: str):
         log.warning(f'TG send failed: {str(e)[:60]}')
 
 
+async def tg_html(message: str):
+    """Send a Telegram HTML message. Silently swallows failures."""
+    global _tg_bot
+    try:
+        if _tg_bot is None:
+            _tg_bot = Bot(token=TG_TOKEN)
+        await _tg_bot.send_message(chat_id=TG_CHAT, text=message, parse_mode='HTML')
+    except Exception as e:
+        log.warning(f'TG send failed: {str(e)[:60]}')
+
+
 def _authed(update: Update) -> bool:
     return str(update.effective_chat.id) == str(TG_CHAT)
 
@@ -2376,6 +2387,67 @@ async def cmd_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f'{icon} Mode set to `{new_mode}`.', parse_mode='Markdown'
     )
+
+
+def _fmt_scan_trade(t: dict) -> str:
+    """Format one newly-placed trade for the post-scan new-trades block (HTML)."""
+    from datetime import date as _date
+    symbol    = t.get('symbol', '?')
+    strategy  = t.get('strategy', '')
+    contracts = int(t.get('contracts') or 1)
+    cr        = float(t.get('credit_debit') or 0)   # negative = debit
+    max_loss  = float(t.get('max_loss') or 0)
+    spot      = float(t.get('spot_price') or 0)
+    mode_s    = t.get('mode') or 'paper'
+
+    strat_labels = {
+        'iron_condor':       'Iron Condor',
+        'put_credit_spread': 'Put Spread',
+        'call_credit_spread':'Call Spread',
+        'jade_lizard':       'Jade Lizard',
+        'debit_spread':      'Debit Spread',
+        'calendar_spread':   'Calendar',
+    }
+    strat_label = strat_labels.get(strategy, strategy)
+
+    def _d(s):
+        try:
+            return _date.fromisoformat(s).strftime('%-d %b')
+        except Exception:
+            return s or '?'
+
+    is_debit = cr < 0
+    cr_label = f'Debit ${abs(cr):.2f}' if is_debit else f'Credit ${cr:.2f}'
+    loss_label = f'Max loss ${abs(max_loss):.0f}' if max_loss else ''
+
+    if strategy == 'calendar_spread':
+        near_s = _d(t.get('near_expiry') or '')
+        far_s  = _d(t.get('far_expiry')  or '')
+        spot_s = f'${spot:.0f}' if spot else ''
+        detail = f'ATM {spot_s}  ·  {near_s} → {far_s}'
+    elif strategy == 'iron_condor':
+        sp = t.get('sell_strike_put') or 0
+        bp = t.get('buy_strike_put')  or 0
+        sc = t.get('sell_call')       or 0
+        bc = t.get('buy_strike')      or 0
+        detail = (f'{bp:.0f}P / <b>{sp:.0f}P</b>  ·  '
+                  f'<b>{sc:.0f}C</b> / {bc:.0f}C')
+    elif strategy == 'jade_lizard':
+        sp = t.get('sell_strike_put') or t.get('sell_strike') or 0
+        sc = t.get('sell_call') or 0
+        bc = t.get('buy_strike') or 0
+        detail = f'Put <b>{sp:.0f}P</b>  ·  Calls <b>{sc:.0f}C</b>/{bc:.0f}C'
+    else:
+        ss  = t.get('sell_strike') or t.get('sell_call') or 0
+        bs  = t.get('buy_strike') or 0
+        exp = _d(t.get('expiry') or '')
+        opt = 'C' if 'call' in strategy else 'P'
+        detail = f'<b>{ss:.0f}{opt}</b> / {bs:.0f}{opt}  ·  {exp}'
+
+    mode_tag = '  <i>[paper]</i>' if mode_s == 'paper' else ''
+    return (f'<b>{symbol}</b>  {strat_label} ×{contracts}{mode_tag}\n'
+            f'  {detail}\n'
+            f'  {cr_label}  ·  {loss_label}')
 
 
 def _fmt_legs(trade: dict, strategy: str) -> str:
@@ -2718,6 +2790,14 @@ def _build_record_kwargs(order: dict, signal: dict, data: dict) -> dict:
     s['strategy']        = strategy
     s['sub_type']        = order.get('sub_type', signal.get('sub_type'))
 
+    # Calendar spread: build_calendar_spread uses 'atm_strike' not 'sell_strike',
+    # and sub_type is '' from select_strategy. Fix both so monitor can price the spread.
+    if strategy == 'calendar_spread':
+        if not s.get('sell_strike'):
+            s['sell_strike'] = order.get('atm_strike')
+        if not s.get('sub_type'):
+            s['sub_type'] = 'call'  # matches _place_order default
+
     is_debit = 'debit' in strategy or 'calendar' in strategy
     if is_debit:
         s['credit_debit'] = -abs(float(order.get('est_debit') or order.get('debit') or 0))
@@ -2898,6 +2978,11 @@ async def run_scan():
 
     traded_today = db.symbols_today()
 
+    # Snapshot max trade ID before scan — used to find newly placed trades at the end
+    with db.get_conn() as _c:
+        _row = _c.execute("SELECT COALESCE(MAX(id), 0) FROM trades").fetchone()
+        pre_scan_id = int(_row[0])
+
     placed   = 0
     skipped  = 0
     errors   = 0
@@ -3013,6 +3098,21 @@ async def run_scan():
     )
     await tg(summary)
     log.info(f'=== SCAN END: {placed} placed, {skipped} skipped, {errors} errors ===')
+
+    # Send new trades block — one HTML message listing every trade opened this scan
+    if placed > 0:
+        try:
+            with db.get_conn() as _c:
+                new_rows = _c.execute(
+                    "SELECT * FROM trades WHERE id > ? AND status='open' ORDER BY id",
+                    (pre_scan_id,)
+                ).fetchall()
+            if new_rows:
+                lines = [_fmt_scan_trade(dict(r)) for r in new_rows]
+                block = f'📋 <b>Trades opened ({len(new_rows)}):</b>\n\n' + '\n\n'.join(lines)
+                await tg_html(block)
+        except Exception as e:
+            log.warning(f'New trades block failed: {e}')
 
 
 # ── Monitor wrapper ─────────────────────────────────────────────────
