@@ -73,10 +73,7 @@ def get_current_balance():
         ).fetchone()[0]
         open_credits = conn.execute(
             """SELECT COALESCE(SUM(
-                CASE WHEN strategy LIKE '%debit%' OR strategy LIKE '%calendar%'
-                     THEN -credit_debit * 100 * contracts
-                     ELSE  credit_debit * 100 * contracts - COALESCE(commission, 0)
-                END
+                credit_debit * 100 * contracts - COALESCE(commission, 0)
             ), 0) FROM trades WHERE status='open'"""
         ).fetchone()[0]
         conn.close()
