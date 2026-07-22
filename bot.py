@@ -2344,7 +2344,7 @@ async def cmd_positions(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if dist_str:
             spot_line += f'  ·  {dist_str}'
         block_lines.append(spot_line)
-        block_lines.append(f'{entry_lbl} ${entry:.2f} → {val_str}  |  P&L: {pnl_str}{warn_stop}')
+        block_lines.append(f'{entry_lbl} ${entry:.2f} × {cts}ct (${capital:.0f}) → {val_str}  |  P&L: {pnl_str}{warn_stop}')
         block_lines.append(f'{tp_line}  |  {sl_line}')
 
         ctx = []
@@ -2657,7 +2657,7 @@ def _fmt_position_block(r: dict) -> str:
     if dist_str:
         spot_line += f'  ·  {dist_str}'
     lines.append(spot_line)
-    lines.append(f'{entry_lbl} ${credit:.2f} → {val_s}  |  P&L: {pnl_s}{warn_stop}')
+    lines.append(f'{entry_lbl} ${credit:.2f} × {contracts}ct (${capital:.0f}) → {val_s}  |  P&L: {pnl_s}{warn_stop}')
     lines.append(f'{tp_line}  |  {sl_line}')
 
     ctx = []
