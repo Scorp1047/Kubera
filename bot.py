@@ -2451,24 +2451,27 @@ def _fmt_scan_trade(t: dict) -> str:
 
 
 def _fmt_legs(trade: dict, strategy: str) -> str:
-    """Format strike legs for display."""
-    sp  = trade.get('sell_strike_put')
-    bp  = trade.get('buy_strike_put')
-    sc  = trade.get('sell_strike') or trade.get('sell_call')
-    bc  = trade.get('buy_strike')
+    """Format strike legs showing short/long direction explicitly."""
+    sp   = trade.get('sell_strike_put')
+    bp   = trade.get('buy_strike_put')
+    sc   = trade.get('sell_strike') or trade.get('sell_call')
+    bc   = trade.get('buy_strike')
     near = trade.get('near_expiry', '')
     far  = trade.get('far_expiry',  '')
+
     def _s(v): return f'{float(v):.2f}'.rstrip('0').rstrip('.')
+
     if strategy == 'iron_condor':
         parts = []
-        if bp and sp: parts.append(f'{_s(bp)}P — {_s(sp)}P')
-        if sc and bc: parts.append(f'{_s(sc)}C — {_s(bc)}C')
-        return ' | '.join(parts)
+        if bp and sp: parts.append(f'Short {_s(sp)}P / Long {_s(bp)}P')
+        if sc and bc: parts.append(f'Short {_s(sc)}C / Long {_s(bc)}C')
+        return '  |  '.join(parts)
     elif strategy == 'put_credit_spread':
-        if sp and bc: return f'{_s(bc)}P — {_s(sp)}P'
-        if sp: return f'{_s(sp)}P short'
+        if sp and bp: return f'Short {_s(sp)}P / Long {_s(bp)}P'
+        if sp:        return f'Short {_s(sp)}P'
     elif strategy == 'call_credit_spread':
-        if sc and bc: return f'{_s(sc)}C — {_s(bc)}C'
+        if sc and bc: return f'Short {_s(sc)}C / Long {_s(bc)}C'
+        if sc:        return f'Short {_s(sc)}C'
     elif strategy == 'calendar_spread':
         strike = sc or bc
         try:
@@ -2476,26 +2479,29 @@ def _fmt_legs(trade: dict, strategy: str) -> str:
             far_s  = date.fromisoformat(far).strftime('%b %d')  if far  else '?'
         except Exception:
             near_s, far_s = near or '?', far or '?'
-        return f'{_s(strike)}C | near {near_s} / far {far_s}' if strike else f'near {near_s} / far {far_s}'
+        if strike:
+            return f'{_s(strike)}C  |  short {near_s} / long {far_s}'
+        return f'short {near_s} / long {far_s}'
     elif strategy == 'debit_spread':
         direction = str(trade.get('direction', '')).lower()
         opt = 'C' if 'call' in direction else 'P'
-        if bc and sc: return f'{_s(bc)}{opt} — {_s(sc)}{opt}'
+        if bc and sc: return f'Long {_s(bc)}{opt} / Short {_s(sc)}{opt}'
     elif strategy == 'jade_lizard':
         parts = []
-        if sp: parts.append(f'{_s(sp)}P short')
-        if sc and bc: parts.append(f'{_s(sc)}C — {_s(bc)}C')
-        return ' | '.join(parts)
+        if sp:        parts.append(f'Short {_s(sp)}P')
+        if sc and bc: parts.append(f'Short {_s(sc)}C / Long {_s(bc)}C')
+        return '  |  '.join(parts)
     return ''
 
 
 def _fmt_position_block(r: dict) -> str:
     """Build a full status block for one position from _monitor_one result."""
-    trade    = r.get('trade', {})
-    symbol   = r['symbol']
-    strategy = r['strategy']
-    action   = r['action']
-    is_debit = 'debit' in strategy or 'calendar' in strategy
+    trade       = r.get('trade', {})
+    symbol      = r['symbol']
+    strategy    = r['strategy']
+    action      = r['action']
+    is_debit    = 'debit' in strategy or 'calendar' in strategy
+    is_calendar = 'calendar' in strategy
 
     strat_label = {
         'iron_condor':        'Iron Condor',
@@ -2517,22 +2523,19 @@ def _fmt_position_block(r: dict) -> str:
     except Exception:
         exp_fmt = expiry_s or '?'
     dte_str = f'DTE {dte_now}' if dte_now is not None else 'DTE ?'
-    if dte_open: dte_str += f' (entered at {dte_open})'
+    if dte_open:
+        dte_str += f' (entered {dte_open})'
 
     # ── Entry economics ────────────────────────────────────
     credit    = abs(float(trade.get('credit_debit') or 0))
-    max_loss  = float(trade.get('max_loss')      or 0)
-    capital   = float(trade.get('capital_used')  or 0)
-    contracts = int(trade.get('contracts')       or 1)
+    contracts = int(trade.get('contracts') or 1)
+    capital   = float(trade.get('capital_used') or (credit * 100 * contracts))
     entry_lbl = 'paid' if is_debit else 'cr'
 
-    target_v  = float(trade.get('target_value') or 0)
-    stop_v    = float(trade.get('stop_value')   or 0)
-
     # ── Current value / P&L ───────────────────────────────
-    value  = r.get('value')
-    pnl    = r.get('pnl_approx')
-    val_s  = f'${value:.2f}' if value is not None else 'no data'
+    value = r.get('value')
+    pnl   = r.get('pnl_approx')
+    val_s = f'${value:.2f}' if value is not None else 'no data'
     if pnl is not None:
         pnl_pct = (pnl / capital * 100) if capital else 0
         sign    = '+' if pnl >= 0 else ''
@@ -2540,7 +2543,19 @@ def _fmt_position_block(r: dict) -> str:
     else:
         pnl_s = 'N/A'
 
-    # ── Spot ──────────────────────────────────────────────
+    # ── Proximity-to-stop warning ─────────────────────────
+    warn_stop = ''
+    if value is not None and credit > 0:
+        if not is_debit:
+            sl_check = credit * LOSS_STOP_MULTIPLIER
+            pct = (value - credit) / (sl_check - credit) if sl_check > credit else 0
+        else:
+            sl_check = credit * (1 - DEBIT_HARD_STOP_PCT)
+            pct = (credit - value) / (credit - sl_check) if credit > sl_check else 0
+        if pct >= 0.75:
+            warn_stop = '  ⚠️'
+
+    # ── Spot + distance to short strikes ──────────────────
     spot_now   = r.get('spot')
     spot_entry = float(trade.get('spot_price') or 0)
     if spot_entry and spot_now and abs(spot_now - spot_entry) > 0.01:
@@ -2552,35 +2567,74 @@ def _fmt_position_block(r: dict) -> str:
     else:
         spot_s = '?'
 
+    dist_str = ''
+    if spot_now:
+        s      = float(spot_now)
+        sc_val = float(trade.get('sell_strike') or trade.get('sell_call') or 0)
+        sp_val = float(trade.get('sell_strike_put') or 0)
+        thresh = s * 0.03  # warn when within 3% of spot
+
+        if strategy == 'iron_condor' and sp_val and sc_val:
+            d_put  = s - sp_val
+            d_call = sc_val - s
+            f_put  = ' ⚠️' if d_put  < thresh else ''
+            f_call = ' ⚠️' if d_call < thresh else ''
+            dist_str = f'+${d_put:.2f} to put{f_put}  |  +${d_call:.2f} to call{f_call}'
+        elif strategy == 'call_credit_spread' and sc_val:
+            d_call = sc_val - s
+            flag   = ' ⚠️' if d_call < thresh else ''
+            dist_str = f'+${d_call:.2f} to short call{flag}'
+        elif strategy in ('put_credit_spread', 'jade_lizard') and sp_val:
+            d_put = s - sp_val
+            flag  = ' ⚠️' if d_put < thresh else ''
+            dist_str = f'+${d_put:.2f} to short put{flag}'
+
+    # ── TP / SL — computed fresh from entry credit ────────
+    if is_debit:
+        pt_pct  = PROFIT_TARGET_CALENDAR if is_calendar else PROFIT_TARGET_DEBIT
+        tp_val  = round(credit * (1 + pt_pct), 2)
+        sl_val  = round(credit * (1 - DEBIT_HARD_STOP_PCT), 2)
+        tp_pnl  = round((tp_val - credit) * 100 * contracts)
+        sl_pnl  = round((credit - sl_val) * 100 * contracts)
+        tp_line = f'TP >${tp_val:.2f} (+${tp_pnl})'
+        sl_line = f'SL <${sl_val:.2f} (-${sl_pnl})'
+    else:
+        tp_val  = round(credit * (1 - PROFIT_TARGET_CREDIT), 2)
+        sl_val  = round(credit * LOSS_STOP_MULTIPLIER, 2)
+        tp_pnl  = round((credit - tp_val) * 100 * contracts)
+        sl_pnl  = round((sl_val - credit) * 100 * contracts)
+        tp_line = f'TP <${tp_val:.2f} (+${tp_pnl})'
+        sl_line = f'SL >${sl_val:.2f} (-${sl_pnl})'
+
     # ── Entry context ─────────────────────────────────────
     ivr  = trade.get('ivr')
     iv   = trade.get('avg_iv') or trade.get('entry_iv')
-    vix  = trade.get('vix_at_entry')
-    bias = trade.get('bias') or ''
     pop  = r.get('pop')
+    bias = trade.get('bias') or ''
     opened_at = (trade.get('opened_at') or '')[:10]
 
-    # ── Legs ──────────────────────────────────────────────
     legs = _fmt_legs(trade, strategy)
 
     lines = [f'{action_icon} *{symbol}* — {strat_label}']
-    lines.append(f'Exp: {exp_fmt} | {dte_str}')
+    lines.append(f'Exp: {exp_fmt}  |  {dte_str}')
     if legs:
-        lines.append(f'Legs: {legs}')
-    lines.append(f'Entry: {entry_lbl} ${credit:.2f} × {contracts}ct | Max loss: ${max_loss:.0f} | Capital: ${capital:.0f}')
-    if target_v and stop_v:
-        lines.append(f'Target: ${target_v:.2f} | Stop: ${stop_v:.2f}')
-    lines.append(f'Value: {val_s} | P&L: {pnl_s}')
-    lines.append(f'Spot: {spot_s}')
+        lines.append(legs)
+    spot_line = f'Spot: {spot_s}'
+    if dist_str:
+        spot_line += f'  ·  {dist_str}'
+    lines.append(spot_line)
+    lines.append(f'{entry_lbl} ${credit:.2f} → {val_s}  |  P&L: {pnl_s}{warn_stop}')
+    lines.append(f'{tp_line}  |  {sl_line}')
 
     ctx = []
     if ivr  is not None: ctx.append(f'IVR {ivr:.0f}%')
     if iv   is not None: ctx.append(f'IV {iv:.1f}%')
-    if vix  is not None: ctx.append(f'VIX {vix:.1f}')
     if pop  is not None: ctx.append(f'POP {pop:.0f}%')
     if bias:             ctx.append(f'Bias {bias}')
-    if ctx: lines.append(' | '.join(ctx))
-    if opened_at: lines.append(f'Opened: {opened_at}')
+    if ctx:
+        lines.append('At entry: ' + ' | '.join(ctx))
+    if opened_at:
+        lines.append(f'Opened: {opened_at}')
 
     if action in ('closed', 'alert') and r.get('reason'):
         lines.append(f'↳ {r["reason"]}')
