@@ -53,7 +53,7 @@ DTE_EXIT          = 21     # time-based exit: close position before this DTE
 # Short strike is placed at TARGET_DELTA; wing is sized by expected move.
 # ═══════════════════════════════════════════════════════════════════
 
-TARGET_DELTA      = 0.16   # short strike delta — 16 delta ≈ 84% POP (1 SD OTM)
+TARGET_DELTA      = 0.10   # short strike delta — 10 delta ≈ 90% POP (further OTM, max POP)
 MIN_POP           = 0.67   # minimum probability of profit to enter any trade
                             # TT: 1/3-width credit rule → ~67% POP minimum
 
@@ -87,6 +87,12 @@ JADE_MIN_CREDIT_RATIO  = 1.0    # (put premium + call spread premium) / call spr
 IC_CREDIT_RATIO        = 0.333  # minimum credit / spread width ratio (1/3 rule)
 IC_MAX_IVR             = 80.0   # block IC when IVR > this (extreme vol = directional move expected)
 
+# ── Credit/Width Ratio Gate (CCS / PCS) ──────────────────────────
+# Applied to call credit spreads and put credit spreads (not ICs — IC uses IC_CREDIT_RATIO).
+# If the premium collected is < 10% of the spread width, the trade is not worth the risk:
+# the P&L asymmetry becomes unfavourable (max loss >> max gain × win rate needed).
+CREDIT_MIN_RATIO       = 0.10   # minimum credit / spread width for CCS and PCS
+
 # ── Calendar Spread ───────────────────────────────────────────────
 # TastyTrade: enter in LOW IVR environments when stock has been abnormally quiet.
 # Profit target 10–25% of debit paid (source: TT calendar spread page).
@@ -94,6 +100,27 @@ IC_MAX_IVR             = 80.0   # block IC when IVR > this (extreme vol = direct
 CAL_DTE_FRONT         = 30     # front month target DTE (sell this)
 CAL_DTE_BACK          = 60     # back month target DTE (buy this)
 CAL_IV_MAX            = 25.0   # only enter calendar when IV < this (low IV required)
+
+# ── Calendar Quality Gate ─────────────────────────────────────────
+# Calendars are long-vega trades: they profit when IV expands.
+# Without a catalyst, calendars in stable-rate / quiet ETFs are bets on nothing.
+#
+# 1. IVR floor: minimum 15% — ensures some vol compression potential exists.
+#    If IVR < 15%, there is nothing to expand into (vol is already dead).
+#
+# 2. Blacklist: fixed-income + macro ETFs that correlate with rate stability.
+#    In a stable-rate environment (VIX < CAL_VIX_OVERRIDE) these have structurally
+#    dead vol. The blacklist is LIFTED when VIX spikes above the override level —
+#    a VIX spike is itself the catalyst that justifies a calendar on these names.
+#
+# 3. Portfolio cap: max 1 open calendar at any time.
+#    Multiple calendars = concentrated long-vega single bet. One is enough.
+CAL_IVR_MIN            = 15.0         # minimum IVR to open a calendar
+CAL_VIX_OVERRIDE       = 22.0         # lift CAL_BLACKLIST when VIX exceeds this level
+CAL_BLACKLIST          = frozenset({  # fixed-income/macro ETFs with structurally dead vol
+    'TLT', 'HYG', 'KRE', 'GLD', 'SLV', 'GDX',
+})
+CAL_MAX_OPEN           = 1            # max concurrent open calendar spreads
 
 # ═══════════════════════════════════════════════════════════════════
 # PROFIT TARGETS
@@ -148,6 +175,15 @@ BIAS_VIX_MOVE_PCT      = 0.10   # VIX must move ≥ 10% over lookback to count a
 # When call IV is unusually rich vs puts → unusual bearish hedging demand.
 BIAS_SKEW_RATIO        = 1.15   # put_iv / call_iv ≥ this = puts "rich" → bullish bias (sell puts)
 BIAS_SKEW_NEUTRAL_LOW  = 0.95   # below this threshold: call IV unusually rich → bearish signal
+
+# Signal 4: EMA20 trend alignment
+# EMA20 gives a 20-day structural trend reading:
+#   - price > EMA20 AND slope positive → uptrend (structure favours bulls)
+#   - price < EMA20 AND slope negative → downtrend (structure favours bears)
+#   - mixed → no signal (counts as abstention in the vote)
+# This catches sustained directional trends that the 5-day price move can miss.
+# e.g., XLE rallied 8% over 3 weeks — 5d move was only +2%, but EMA slope was clearly up.
+EMA_TREND_PERIOD       = 20     # EMA lookback period for trend alignment signal
 
 # ═══════════════════════════════════════════════════════════════════
 # POSITION SIZING

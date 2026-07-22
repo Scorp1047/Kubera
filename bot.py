@@ -33,6 +33,8 @@ from config import (
     PROFIT_TARGET_CREDIT, PROFIT_TARGET_DEBIT, PROFIT_TARGET_CALENDAR,
     LOSS_STOP_MULTIPLIER, DEBIT_HARD_STOP_PCT,
     CAL_DTE_FRONT, CAL_DTE_BACK, CAL_IV_MAX,
+    CAL_IVR_MIN, CAL_VIX_OVERRIDE, CAL_BLACKLIST, CAL_MAX_OPEN,
+    CREDIT_MIN_RATIO, EMA_TREND_PERIOD,
     KILL_SWITCH, REAL_BALANCE,
     IVR_HIGH, IVR_MEDIUM_FLOOR, IVR_LOW_CEILING,
     BIAS_MOVE_THRESHOLD, BIAS_VIX_LOOKBACK, BIAS_VIX_MOVE_PCT,
@@ -237,10 +239,40 @@ async def get_vix():
     return ctx['vix']
 
 
+# ── EMA Trend Helpers ──────────────────────────────────────────────
+
+def compute_ema(closes, period):
+    """Compute EMA over a price series. Returns final EMA value."""
+    if len(closes) < period:
+        return closes[-1] if closes else 0.0
+    k = 2.0 / (period + 1)
+    ema = sum(closes[:period]) / period
+    for price in closes[period:]:
+        ema = price * k + ema * (1 - k)
+    return ema
+
+
+def get_ema_trend(closes, period=EMA_TREND_PERIOD):
+    """Determine EMA trend from price series.
+    Returns (ema_value, slope_up: bool | None).
+    slope_up=True → rising, False → falling, None → flat/insufficient data."""
+    if len(closes) < period + 1:
+        return 0.0, None
+    ema_now  = compute_ema(closes, period)
+    ema_prev = compute_ema(closes[:-1], period)
+    slope_threshold = ema_now * 0.001  # 0.1% of EMA = meaningful slope
+    if (ema_now - ema_prev) > slope_threshold:
+        return ema_now, True   # rising
+    elif (ema_prev - ema_now) > slope_threshold:
+        return ema_now, False  # falling
+    return ema_now, None       # flat
+
+
 # ── Directional Bias Detection ─────────────────────────────────────
 
-def get_bias(closes, vix_dir, chain_calls=None, chain_puts=None, iv_frac=None):
-    """3-signal bias vote: price action + VIX direction + vol skew.
+def get_bias(closes, vix_dir, chain_calls=None, chain_puts=None, iv_frac=None,
+             ema20=None, ema_slope_up=None):
+    """4-signal bias vote: price action + VIX direction + vol skew + EMA20 trend.
     Returns ('BULL' | 'BEAR' | 'NEUTRAL', reason_string)."""
     votes   = []
     reasons = []
@@ -301,6 +333,22 @@ def get_bias(closes, vix_dir, chain_calls=None, chain_puts=None, iv_frac=None):
     else:
         votes.append('NEUTRAL')
         reasons.append('skew: no chain data')
+
+    # Signal 4: EMA20 structural trend
+    if ema20 is not None and ema_slope_up is not None and closes:
+        price_now = closes[-1]
+        if price_now > ema20 and ema_slope_up is True:
+            votes.append('BULL')
+            reasons.append(f'EMA20 uptrend (price ${price_now:.1f} > EMA ${ema20:.1f}, rising)')
+        elif price_now < ema20 and ema_slope_up is False:
+            votes.append('BEAR')
+            reasons.append(f'EMA20 downtrend (price ${price_now:.1f} < EMA ${ema20:.1f}, falling)')
+        else:
+            votes.append('NEUTRAL')
+            reasons.append(f'EMA20 mixed (price ${price_now:.1f}, EMA ${ema20:.1f})')
+    else:
+        votes.append('NEUTRAL')
+        reasons.append('EMA20: no data')
 
     bull_votes = votes.count('BULL')
     bear_votes = votes.count('BEAR')
@@ -450,7 +498,7 @@ def _find_strike(option_type, price, options, greeks_data, iv_frac, T, r, em_dol
 
 # ── Main Data Fetch ────────────────────────────────────────────────
 
-async def get_options_data(symbol, vix_dir='unknown', tt_cache=None,
+async def get_options_data(symbol, vix_dir='unknown', vix_value=20.0, tt_cache=None,
                            dte_min_override=None, dte_max_override=None):
     """Fetch all data needed to select a strategy and build strikes.
     Returns data dict or None if symbol should be skipped."""
@@ -467,6 +515,9 @@ async def get_options_data(symbol, vix_dir='unknown', tt_cache=None,
             return None
 
         closes = list(hist['Close'].astype(float))
+
+        # ── EMA20 for trend gate ────────────────────────────────────
+        ema20_val, ema20_slope_up = get_ema_trend(closes, EMA_TREND_PERIOD)
 
         # ── 2. Spot price ──────────────────────────────────────────
         price = round(float(closes[-1]), 2)
@@ -580,7 +631,10 @@ async def get_options_data(symbol, vix_dir='unknown', tt_cache=None,
         best_call = _find_strike('call', price, chain_calls, greeks_data, expiry_iv_frac, T, r, em_dollar)
 
         # ── 8. Directional bias ─────────────────────────────────────
-        bias, bias_reason = get_bias(closes, vix_dir, chain_calls, chain_puts, expiry_iv_frac)
+        bias, bias_reason = get_bias(
+            closes, vix_dir, chain_calls, chain_puts, expiry_iv_frac,
+            ema20=ema20_val, ema_slope_up=ema20_slope_up,
+        )
 
         # ── 9. Earnings check ───────────────────────────────────────
         earnings = []
@@ -595,24 +649,27 @@ async def get_options_data(symbol, vix_dir='unknown', tt_cache=None,
             pass
 
         return {
-            'symbol':      symbol,
-            'price':       price,
-            'move_5d':     round((closes[-1] - closes[-6]) / closes[-6] * 100, 1) if len(closes) >= 6 else 0.0,
-            'avg_iv':      avg_iv,
-            'ivr':         ivr,
-            'ivr_regime':  ivr_regime,
-            'bias':        bias,
-            'bias_reason': bias_reason,
-            'expiry':      target_exp,
-            'dte':         target_dte,
-            'em_dollar':   em_dollar,
-            'em_pct':      em_pct,
-            'best_put':    best_put,
-            'best_call':   best_call,
-            'chain_calls': chain_calls,
-            'chain_puts':  chain_puts,
-            'earnings':    earnings,
-            'sector':      SECTOR_MAP.get(symbol, 'Unknown'),
+            'symbol':        symbol,
+            'price':         price,
+            'move_5d':       round((closes[-1] - closes[-6]) / closes[-6] * 100, 1) if len(closes) >= 6 else 0.0,
+            'avg_iv':        avg_iv,
+            'ivr':           ivr,
+            'ivr_regime':    ivr_regime,
+            'bias':          bias,
+            'bias_reason':   bias_reason,
+            'expiry':        target_exp,
+            'dte':           target_dte,
+            'em_dollar':     em_dollar,
+            'em_pct':        em_pct,
+            'best_put':      best_put,
+            'best_call':     best_call,
+            'chain_calls':   chain_calls,
+            'chain_puts':    chain_puts,
+            'earnings':      earnings,
+            'sector':        SECTOR_MAP.get(symbol, 'Unknown'),
+            'ema20':         ema20_val,
+            'ema_slope_up':  ema20_slope_up,
+            'vix_value':     vix_value,
         }
 
     except Exception as e:
@@ -760,6 +817,61 @@ def validate_entry(data, strategy, sub_type, earnings_cache, open_positions):
         failures.append(f'IC blocked: IVR {ivr:.0f}% > {IC_MAX_IVR:.0f}% (extreme IV implies large move)')
         return False, failures
 
+    # ── Fix 1: Trend alignment gate ─────────────────────────────────
+    # Block strategies that short options against the structural trend.
+    # IC sells both sides → needs flat/range-bound market → blocked in any clear trend.
+    # CCS/PCS: blocked only when shorting INTO the trend.
+    ema20       = data.get('ema20')
+    slope_up    = data.get('ema_slope_up')
+    price_now   = data.get('price', 0.0)
+    if ema20 and ema20 > 0 and slope_up is not None:
+        in_uptrend   = (price_now > ema20) and (slope_up is True)
+        in_downtrend = (price_now < ema20) and (slope_up is False)
+        if strategy == 'iron_condor' and (in_uptrend or in_downtrend):
+            direction = 'uptrend' if in_uptrend else 'downtrend'
+            failures.append(
+                f'Trend gate: {symbol} in {direction} (EMA20={ema20:.2f}) — IC blocked, use directional spread'
+            )
+            return False, failures
+        if strategy == 'call_credit_spread' and in_uptrend:
+            failures.append(
+                f'Trend gate: {symbol} above rising EMA20 ({ema20:.2f}) — call shorts blocked'
+            )
+            return False, failures
+        if strategy in ('put_credit_spread', 'jade_lizard') and in_downtrend:
+            failures.append(
+                f'Trend gate: {symbol} below falling EMA20 ({ema20:.2f}) — put shorts blocked'
+            )
+            return False, failures
+
+    # ── Fix 2: Calendar quality gate ────────────────────────────────
+    if strategy == 'calendar_spread':
+        vix_now = data.get('vix_value', 20.0)
+
+        # 2a. IVR floor
+        if ivr < CAL_IVR_MIN:
+            failures.append(f'Calendar IVR floor: IVR {ivr:.0f}% < {CAL_IVR_MIN:.0f}% minimum')
+            return False, failures
+
+        # 2b. Fixed-income / macro blacklist (lifted when VIX spikes)
+        if symbol in CAL_BLACKLIST and vix_now < CAL_VIX_OVERRIDE:
+            failures.append(
+                f'Calendar blocked: {symbol} is fixed-income/macro '
+                f'(VIX {vix_now:.1f} < {CAL_VIX_OVERRIDE:.0f} — no vol catalyst)'
+            )
+            return False, failures
+
+        # 2c. Portfolio cap: max 1 open calendar at a time
+        open_calendars = sum(
+            1 for p in open_positions
+            if p.get('status') == 'open' and p.get('strategy') == 'calendar_spread'
+        )
+        if open_calendars >= CAL_MAX_OPEN:
+            failures.append(
+                f'Calendar cap: already {open_calendars} open calendar — max {CAL_MAX_OPEN} at a time'
+            )
+            return False, failures
+
     sector_count = sum(
         1 for p in open_positions
         if SECTOR_MAP.get(p.get('symbol', ''), 'Unknown') == sector
@@ -848,6 +960,16 @@ def build_signal(data, strategy, sub_type, balance, call_spread_width=5.0):
         put_delta    = best_put.get('delta', 0.0)
         put_iv       = best_put.get('iv', avg_iv)
         wing_width   = round(max(call_spread_width, em_dollar * 1.5), 0)
+
+        # ── Fix 3: Credit/width ratio gate (PCS only; IC uses IC_CREDIT_RATIO) ──
+        if strategy == 'put_credit_spread' and wing_width > 0:
+            ratio = put_credit / wing_width
+            if ratio < CREDIT_MIN_RATIO:
+                log.info(
+                    f'build_signal: {symbol} put_credit_spread credit ratio '
+                    f'{ratio*100:.1f}% < {CREDIT_MIN_RATIO*100:.0f}% — skip'
+                )
+                return None
 
         bpr_per_contract = (wing_width - put_credit) * 100
         contracts        = calculate_size(balance, bpr_per_contract)
@@ -944,6 +1066,16 @@ def build_signal(data, strategy, sub_type, balance, call_spread_width=5.0):
         call_delta   = best_call.get('delta', 0.0)
         call_iv      = best_call.get('iv', avg_iv)
         wing_width   = round(max(call_spread_width, em_dollar * 1.5), 0)
+
+        # ── Fix 3: Credit/width ratio gate ──────────────────────────
+        if wing_width > 0:
+            ratio = call_credit / wing_width
+            if ratio < CREDIT_MIN_RATIO:
+                log.info(
+                    f'build_signal: {symbol} call_credit_spread credit ratio '
+                    f'{ratio*100:.1f}% < {CREDIT_MIN_RATIO*100:.0f}% — skip'
+                )
+                return None
 
         bpr_per_contract = (wing_width - call_credit) * 100
         contracts        = calculate_size(balance, bpr_per_contract)
@@ -3088,7 +3220,9 @@ async def run_scan():
             continue
 
         try:
-            data = await get_options_data(symbol, vix_dir=vix_dir, tt_cache=tt_cache)
+            data = await get_options_data(symbol, vix_dir=vix_dir,
+                                          vix_value=vix_data.get('vix', 20.0),
+                                          tt_cache=tt_cache)
             if data is None:
                 skipped += 1
                 continue
