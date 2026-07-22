@@ -16,6 +16,7 @@ import json
 import logging
 import math
 import os
+import re
 import threading
 from datetime import datetime, date, timedelta
 
@@ -47,8 +48,15 @@ from config import (
     SAFE_HAVEN_SYMBOLS, BLOCKED_SYMBOLS,
     ROLL_POP_FLOOR,
 )
+import requests
 import tasty as tt
 import database as db
+
+
+# ── Grok AI screener ───────────────────────────────────────────────
+
+GROK_KEY   = os.getenv('GROK_API_KEY')
+GROK_MODEL = 'grok-4.20-0309-reasoning'
 
 
 # ── File paths ─────────────────────────────────────────────────────
@@ -740,6 +748,221 @@ def check_jade_lizard(best_put, best_call, call_spread_width):
             f'Jade Lizard invalid: credit ${total_credit:.2f} < required ${required_min_credit:.2f} '
             f'→ downgrade to put credit spread'
         )
+
+
+# ── Grok AI Catalyst Screener ──────────────────────────────────────
+
+def _build_screen_prompt(signal: dict) -> str:
+    """Build a Grok prompt tailored to the strategy and thesis."""
+    symbol   = signal['symbol']
+    strategy = signal['strategy']
+    expiry   = signal['expiry']
+    dte      = signal['dte']
+    bias     = signal.get('bias', 'NEUTRAL')
+    ivr      = signal.get('ivr', 0)
+    price    = signal.get('price', 0)
+    sector   = signal.get('sector', 'Unknown')
+
+    if strategy == 'iron_condor':
+        thesis = (
+            f'sell an iron condor on {symbol} — thesis is NEUTRAL/range-bound, '
+            f'expecting no large directional move by {expiry} ({dte} days)'
+        )
+        risk_question = (
+            f'Is there a known event or catalyst in the next {dte} days that could cause '
+            f'a large directional move in {symbol} (earnings, FOMC, regulatory decision, '
+            f'index rebalance, major product announcement, geopolitical event affecting the {sector} sector)?'
+        )
+    elif strategy in ('put_credit_spread', 'jade_lizard'):
+        thesis = (
+            f'sell a put credit spread on {symbol} — thesis is BULLISH, '
+            f'expecting {symbol} to stay above the short put by {expiry} ({dte} days)'
+        )
+        risk_question = (
+            f'Is there a known bearish catalyst in the next {dte} days that would '
+            f'contradict a bullish thesis on {symbol} '
+            f'(earnings miss expected, analyst downgrade, product recall, sector headwind, '
+            f'regulatory risk, major competitor news, insider selling)?'
+        )
+    elif strategy == 'call_credit_spread':
+        thesis = (
+            f'sell a call credit spread on {symbol} — thesis is BEARISH, '
+            f'expecting {symbol} to stay below the short call by {expiry} ({dte} days)'
+        )
+        risk_question = (
+            f'Is there a known bullish catalyst in the next {dte} days that would '
+            f'contradict a bearish thesis on {symbol} '
+            f'(earnings beat expected, analyst upgrade, activist investor, buyback announcement, '
+            f'short squeeze setup, strong sector tailwind)?'
+        )
+    elif strategy == 'calendar_spread':
+        thesis = (
+            f'open a calendar spread on {symbol} — thesis is LONG VOLATILITY, '
+            f'expecting IV to expand by {expiry} ({dte} days). '
+            f'Current IVR is {ivr:.0f}% (low — this is why a calendar was selected)'
+        )
+        risk_question = (
+            f'Is there a known upcoming catalyst in the next {dte} days that could cause '
+            f'an IV expansion in {symbol} '
+            f'(earnings, product launch, FDA decision, FOMC, major index event, analyst day, legal ruling)? '
+            f'NOTE: for calendars, a vol catalyst is REQUIRED — the trade has no thesis without one. '
+            f'If no clear catalyst exists, return BLOCK.'
+        )
+    elif strategy == 'debit_spread':
+        direction = 'BULLISH' if signal.get('sub_type') == 'call' else 'BEARISH'
+        thesis = (
+            f'buy a debit spread on {symbol} — thesis is {direction}, '
+            f'expecting a strong directional move by {expiry} ({dte} days)'
+        )
+        risk_question = (
+            f'Is there a known catalyst supporting a {direction.lower()} move in {symbol} '
+            f'in the next {dte} days, AND is there any opposing catalyst that could '
+            f'prevent the move (binary event going the wrong way, fading momentum)?'
+        )
+    else:
+        thesis = f'trade {strategy} on {symbol} expiring {expiry} ({dte} days)'
+        risk_question = (
+            f'Is there any known catalyst or event in the next {dte} days '
+            f'that would make this trade particularly risky?'
+        )
+
+    return (
+        f'You are a systematic options trader reviewing a proposed trade before execution.\n\n'
+        f'PROPOSED TRADE:\n'
+        f'- Symbol: {symbol} (${price:.2f}, sector: {sector})\n'
+        f'- Strategy: {strategy}\n'
+        f'- Thesis: {thesis}\n'
+        f'- Expiry: {expiry} ({dte} DTE)\n'
+        f'- IVR: {ivr:.0f}%\n\n'
+        f'TASK:\n'
+        f'Use web_search to find current information about {symbol} and answer this question:\n'
+        f'{risk_question}\n\n'
+        f'INSTRUCTIONS:\n'
+        f'- Search for news about {symbol} published in the last 7 days\n'
+        f'- Search for upcoming events: earnings calendar, analyst actions, regulatory news, macro events\n'
+        f'- Be specific: name the event and its date if you find one\n'
+        f'- If you find no clear catalyst risk, return PROCEED\n'
+        f'- For calendar spreads: return BLOCK if no volatility catalyst found\n'
+        f'- Do not invent events — only cite what you actually find via search\n\n'
+        f'Respond in this exact JSON format:\n'
+        f'{{"verdict": "PROCEED" or "BLOCK", "reason": "one sentence — cite the specific event/risk, or state no catalyst risk found"}}'
+    )
+
+
+def _grok_call(prompt: str) -> dict | None:
+    """Call Grok Responses API with web_search. Returns parsed JSON or None."""
+    if not GROK_KEY:
+        return None
+
+    payload = {
+        'model':             GROK_MODEL,
+        'input':             [{'role': 'user', 'content': prompt}],
+        'max_output_tokens': 500,
+        'temperature':       0.1,
+        'tools':             [{'type': 'web_search'}],
+    }
+    headers = {
+        'Authorization': 'Bearer ' + GROK_KEY,
+        'Content-Type':  'application/json',
+    }
+
+    previous_response_id = None
+    for iteration in range(6):
+        current_payload = payload if not previous_response_id else {
+            'model': GROK_MODEL,
+            'previous_response_id': previous_response_id,
+        }
+        try:
+            r = requests.post(
+                'https://api.x.ai/v1/responses',
+                headers=headers,
+                json=current_payload,
+                timeout=120,
+            )
+        except Exception as e:
+            log.error(f'Grok screen request error: {str(e)[:120]}')
+            return None
+
+        if r.status_code != 200:
+            log.error(f'Grok screen HTTP {r.status_code}: {r.text[:200]}')
+            return None
+
+        data   = r.json()
+        status = data.get('status', 'completed')
+        rid    = data.get('id')
+        output = data.get('output', [])
+
+        raw = ''
+        for item in output:
+            if item.get('type') == 'message':
+                for block in item.get('content', []):
+                    if block.get('type') == 'output_text':
+                        raw += block.get('text', '')
+
+        if raw.strip():
+            raw = re.sub(r'\[\[?\d+\]?\]\([^)]*\)', '', raw)
+            raw = re.sub(r'<grok:[^>]+>.*?</grok:[^>]+>', '', raw, flags=re.DOTALL)
+            raw = raw.replace('```json', '').replace('```', '').strip()
+            start = raw.find('{')
+            end   = raw.rfind('}')
+            if start == -1 or end == -1:
+                log.error(f'Grok screen: no JSON in output: {raw[:200]}')
+                return None
+            try:
+                result = json.loads(raw[start:end + 1])
+                _cite  = re.compile(r'<grok:[^>]+>.*?</grok:[^>]+>', re.DOTALL)
+                for k, v in result.items():
+                    if isinstance(v, str):
+                        result[k] = _cite.sub('', v).strip()
+                return result
+            except Exception as e:
+                log.error(f'Grok screen JSON parse error: {e}')
+                return None
+
+        if status in ('in_progress', 'requires_action', 'queued') and rid:
+            previous_response_id = rid
+            continue
+
+        log.error(f'Grok screen: no text. status={status}')
+        return None
+
+    log.error('Grok screen: max iterations reached')
+    return None
+
+
+def grok_screen(signal: dict) -> tuple:
+    """AI catalyst screener — hard block gate.
+    Queries Grok with web_search for real-time catalyst risk.
+    Returns (proceed: bool, reason: str).
+    Fails OPEN — if Grok is unavailable the trade proceeds."""
+    symbol   = signal.get('symbol', '?')
+    strategy = signal.get('strategy', '?')
+
+    if not GROK_KEY:
+        log.warning(f'grok_screen: GROK_API_KEY not set — skipping for {symbol}')
+        return True, 'AI screen skipped (key not configured)'
+
+    try:
+        prompt = _build_screen_prompt(signal)
+        log.info(f'AI screen: querying Grok for {symbol} {strategy}...')
+        result = _grok_call(prompt)
+
+        if result is None:
+            log.warning(f'AI screen: Grok unavailable for {symbol} — proceeding')
+            return True, 'AI screen unavailable — proceeding'
+
+        verdict = str(result.get('verdict', 'PROCEED')).upper().strip()
+        reason  = str(result.get('reason', '')).strip() or 'No specific risk found'
+
+        log.info(f'AI screen {symbol}: {verdict} — {reason}')
+
+        if verdict == 'BLOCK':
+            return False, reason
+        return True, reason
+
+    except Exception as e:
+        log.warning(f'AI screen error for {symbol}: {str(e)[:80]} — proceeding')
+        return True, f'AI screen error — proceeding'
 
 
 # ── Entry Validation ──────────────────────────────────────────────
@@ -2611,10 +2834,17 @@ def _fmt_scan_trade(t: dict) -> str:
         opt = 'C' if 'call' in strategy else 'P'
         detail = f'<b>{ss:.0f}{opt}</b> / {bs:.0f}{opt}  ·  {exp}'
 
+    ai_reason = t.get('ai_reason', '')
+
     mode_tag = '  <i>[paper]</i>' if mode_s == 'paper' else ''
-    return (f'<b>{symbol}</b>  {strat_label} ×{contracts}{mode_tag}\n'
-            f'  {detail}\n'
-            f'  {cr_label}  ·  {loss_label}')
+    lines = [
+        f'<b>{symbol}</b>  {strat_label} ×{contracts}{mode_tag}',
+        f'  {detail}',
+        f'  {cr_label}  ·  {loss_label}',
+    ]
+    if ai_reason:
+        lines.append(f'  🤖 <i>{ai_reason}</i>')
+    return '\n'.join(lines)
 
 
 def _fmt_legs(trade: dict, strategy: str) -> str:
@@ -3205,10 +3435,11 @@ async def run_scan():
         _row = _c.execute("SELECT COALESCE(MAX(id), 0) FROM trades").fetchone()
         pre_scan_id = int(_row[0])
 
-    placed   = 0
-    skipped  = 0
-    errors   = 0
-    open_now = open_count
+    placed      = 0
+    skipped     = 0
+    errors      = 0
+    open_now    = open_count
+    ai_reasons  = {}   # symbol → ai_reason for post-scan TG block
 
     for symbol in symbols:
         if open_now >= MAX_POSITIONS:
@@ -3263,6 +3494,15 @@ async def run_scan():
                 skipped += 1
                 continue
 
+            # ── AI catalyst screener (hard block) ──────────────────
+            ai_proceed, ai_reason = grok_screen(signal)
+            if not ai_proceed:
+                log.info(f'SKIP {symbol}: AI screen BLOCK — {ai_reason}')
+                await tg(f'🤖 *AI blocked* {symbol} {strategy}\n_{ai_reason}_')
+                skipped += 1
+                continue
+            signal['ai_reason'] = ai_reason
+
             if strategy == 'calendar_spread':
                 far_list = await tt.tt_get_option_instruments(
                     symbol, CAL_DTE_BACK - 10, CAL_DTE_BACK + 15,
@@ -3309,6 +3549,7 @@ async def run_scan():
                 open_now += 1
                 sector_counts[sector] = sector_counts.get(sector, 0) + 1
                 traded_today.add(symbol)
+                ai_reasons[symbol] = signal.get('ai_reason', '')
             else:
                 errors += 1
 
@@ -3332,7 +3573,12 @@ async def run_scan():
                     (pre_scan_id,)
                 ).fetchall()
             if new_rows:
-                lines = [_fmt_scan_trade(dict(r)) for r in new_rows]
+                rows_with_ai = []
+                for r in new_rows:
+                    row = dict(r)
+                    row['ai_reason'] = ai_reasons.get(row.get('symbol', ''), '')
+                    rows_with_ai.append(row)
+                lines = [_fmt_scan_trade(r) for r in rows_with_ai]
                 block = f'📋 <b>Trades opened ({len(new_rows)}):</b>\n\n' + '\n\n'.join(lines)
                 await tg_html(block)
         except Exception as e:
