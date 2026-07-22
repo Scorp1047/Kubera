@@ -2210,122 +2210,156 @@ async def cmd_positions(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text('No open positions.')
         return
 
-    _strat_label = {
-        'iron_condor':        'Iron Condor',
-        'put_credit_spread':  'Put Credit Spread',
-        'call_credit_spread': 'Call Credit Spread',
-        'jade_lizard':        'Jade Lizard',
-        'debit_spread':       'Debit Spread',
-        'calendar_spread':    'Calendar Spread',
-    }
-
     today = date.today()
-    lines = [f'<b>Open Positions ({len(trades)})</b>']
+    header = f'*Open Positions ({len(trades)})*'
+    await update.message.reply_text(header, parse_mode='Markdown')
 
-    for t in trades:
-        t = dict(t)
-        strategy = t.get('strategy', '?')
-        symbol   = t.get('symbol', '?')
-        strat    = _strat_label.get(strategy, strategy)
-        cts      = int(t.get('contracts') or 1)
+    for row in trades:
+        t           = dict(row)
+        strategy    = t.get('strategy', '?')
+        symbol      = t.get('symbol', '?')
+        cts         = int(t.get('contracts') or 1)
+        is_debit    = (t.get('credit_debit') or 0) < 0
+        is_calendar = 'calendar' in strategy
 
-        # DTE
-        expiry_s = t.get('expiry') or t.get('near_expiry') or t.get('far_expiry', '?')
+        strat_label = {
+            'iron_condor':        'Iron Condor',
+            'put_credit_spread':  'Put Credit Spread',
+            'call_credit_spread': 'Call Credit Spread',
+            'jade_lizard':        'Jade Lizard',
+            'debit_spread':       'Debit Spread',
+            'calendar_spread':    'Calendar Spread',
+        }.get(strategy, strategy)
+
+        entry   = abs(float(t.get('credit_debit') or 0))
+        capital = float(t.get('capital_used') or (entry * 100 * cts))
+        entry_lbl = 'paid' if is_debit else 'cr'
+
+        # ── DTE ───────────────────────────────────────────────
+        expiry_s = t.get('expiry') or t.get('near_expiry') or ''
         try:
-            dte = (date.fromisoformat(expiry_s) - today).days
+            exp_fmt = date.fromisoformat(expiry_s).strftime('%b %d') if expiry_s else '?'
+            dte_str = str((date.fromisoformat(expiry_s) - today).days)
         except Exception:
-            dte = '?'
+            exp_fmt = expiry_s or '?'
+            dte_str = '?'
+        dte_open = t.get('dte_at_open')
+        dte_line = f'DTE {dte_str}'
+        if dte_open:
+            dte_line += f' (entered {dte_open})'
 
-        # Credit / debit at entry
-        cr       = float(t.get('credit_debit') or 0)
-        is_debit = cr < 0
-        entry    = abs(cr)
-
-        # Current value and P&L
-        cur_val  = t.get('last_spread_value')
+        # ── Current value / P&L ───────────────────────────────
+        cur_val = t.get('last_spread_value')
         if cur_val is not None:
             cur_val = float(cur_val)
-            if is_debit:
-                pnl_per = cur_val - entry          # debit: profit = value rose
-            else:
-                pnl_per = entry - cur_val          # credit: profit = value fell
+            pnl_per = (cur_val - entry) if is_debit else (entry - cur_val)
             pnl_usd = round(pnl_per * 100 * cts, 2)
-            pnl_pct = round(pnl_per / entry * 100, 1) if entry else 0
-            pnl_sign = '+' if pnl_usd >= 0 else ''
-            pnl_str  = f'{pnl_sign}${pnl_usd:.2f} ({pnl_sign}{pnl_pct:.1f}%)'
-            val_str  = f'${cur_val:.2f}'
+            pnl_pct = round(pnl_usd / capital * 100, 1) if capital else 0
+            sign    = '+' if pnl_usd >= 0 else ''
+            val_str = f'${cur_val:.2f}'
+            pnl_str = f'{sign}${pnl_usd:.0f} ({sign}{pnl_pct:.1f}%)'
         else:
-            pnl_str = 'n/a'
             val_str = 'n/a'
+            pnl_str = 'n/a'
+            cur_val = None
 
-        # Spot price (from last monitor cycle)
-        spot = t.get('last_spot_price') or t.get('spot_price')
-        spot_str = f'${float(spot):.2f}' if spot else 'n/a'
+        # ── Proximity-to-stop warning ─────────────────────────
+        warn_stop = ''
+        if cur_val is not None and entry > 0:
+            if not is_debit:
+                sl_chk = entry * LOSS_STOP_MULTIPLIER
+                pct = (cur_val - entry) / (sl_chk - entry) if sl_chk > entry else 0
+            else:
+                sl_chk = entry * (1 - DEBIT_HARD_STOP_PCT)
+                pct = (entry - cur_val) / (entry - sl_chk) if entry > sl_chk else 0
+            if pct >= 0.75:
+                warn_stop = '  ⚠️'
 
-        # Strike structure + distance to short strike
-        sell_put  = t.get('sell_strike_put')
-        buy_put   = t.get('buy_strike_put')
-        sell_call = t.get('sell_call') or t.get('sell_strike')
-        buy_call  = t.get('buy_strike')
+        # ── Spot + distance to short strikes ──────────────────
+        spot       = t.get('last_spot_price') or t.get('spot_price')
+        spot_entry = float(t.get('spot_price') or 0)
+        spot_now   = float(spot) if spot else None
 
-        if strategy == 'iron_condor' and sell_put and sell_call:
-            strikes_str = f'P {buy_put:.0f}/{sell_put:.0f} | C {sell_call:.0f}/{buy_call:.0f}'
-            if spot:
-                s = float(spot)
-                dist_put  = round(s - float(sell_put),  2)
-                dist_call = round(float(sell_call) - s, 2)
-                dist_str  = f'dist: {dist_put:+.2f} to put short, {dist_call:+.2f} to call short'
-            else:
-                dist_str = ''
-        elif strategy in ('call_credit_spread',) and sell_call:
-            strikes_str = f'C {sell_call:.0f}/{buy_call:.0f}'
-            if spot:
-                dist_str = f'dist: {round(float(sell_call) - float(spot), 2):+.2f} to short strike'
-            else:
-                dist_str = ''
-        elif strategy in ('put_credit_spread', 'jade_lizard') and t.get('sell_strike'):
-            sp = float(t['sell_strike'])
-            bp = float(t.get('buy_strike') or 0)
-            strikes_str = f'P {bp:.0f}/{sp:.0f}'
-            if sell_call:
-                strikes_str += f' | C {sell_call:.0f}'
-            if spot:
-                dist_str = f'dist: {round(float(spot) - sp, 2):+.2f} to short strike'
-            else:
-                dist_str = ''
-        elif strategy == 'calendar_spread':
-            atm = t.get('sell_strike') or t.get('buy_strike')
-            strikes_str = f'ATM {atm:.0f}' if atm else ''
-            dist_str = ''
+        if spot_entry and spot_now and abs(spot_now - spot_entry) > 0.01:
+            spot_s = f'${spot_entry:.2f} → ${spot_now:.2f}'
+        elif spot_now:
+            spot_s = f'${spot_now:.2f}'
+        elif spot_entry:
+            spot_s = f'${spot_entry:.2f} (entry)'
         else:
-            strikes_str = ''
-            dist_str = ''
+            spot_s = 'n/a'
 
-        # TP / SL — show close value and resulting dollar P&L at each level
-        tp = t.get('target_value')
-        sl = t.get('stop_value')
-        if tp and sl and entry:
-            tp_profit = round((entry - float(tp)) * 100 * cts, 2) if not is_debit else round((float(tp) - entry) * 100 * cts, 2)
-            sl_loss   = round((entry - float(sl)) * 100 * cts, 2) if not is_debit else round((float(sl) - entry) * 100 * cts, 2)
-            tp_sl = f'TP: +${tp_profit:.0f} | SL: ${sl_loss:.0f}'
+        dist_str = ''
+        if spot_now:
+            s      = spot_now
+            sc_val = float(t.get('sell_strike') or t.get('sell_call') or 0)
+            sp_val = float(t.get('sell_strike_put') or 0)
+            thresh = s * 0.03
+
+            if strategy == 'iron_condor' and sp_val and sc_val:
+                d_put  = s - sp_val
+                d_call = sc_val - s
+                f_put  = ' ⚠️' if d_put  < thresh else ''
+                f_call = ' ⚠️' if d_call < thresh else ''
+                dist_str = f'+${d_put:.2f} to put{f_put}  |  +${d_call:.2f} to call{f_call}'
+            elif strategy == 'call_credit_spread' and sc_val:
+                d_call = sc_val - s
+                flag   = ' ⚠️' if d_call < thresh else ''
+                dist_str = f'+${d_call:.2f} to short call{flag}'
+            elif strategy in ('put_credit_spread', 'jade_lizard') and sp_val:
+                d_put = s - sp_val
+                flag  = ' ⚠️' if d_put < thresh else ''
+                dist_str = f'+${d_put:.2f} to short put{flag}'
+
+        # ── TP / SL ───────────────────────────────────────────
+        if is_debit:
+            pt_pct  = PROFIT_TARGET_CALENDAR if is_calendar else PROFIT_TARGET_DEBIT
+            tp_val  = round(entry * (1 + pt_pct), 2)
+            sl_val  = round(entry * (1 - DEBIT_HARD_STOP_PCT), 2)
+            tp_pnl  = round((tp_val - entry) * 100 * cts)
+            sl_pnl  = round((entry - sl_val) * 100 * cts)
+            tp_line = f'TP >${tp_val:.2f} (+${tp_pnl})'
+            sl_line = f'SL <${sl_val:.2f} (-${sl_pnl})'
         else:
-            tp_sl = ''
+            tp_val  = round(entry * (1 - PROFIT_TARGET_CREDIT), 2)
+            sl_val  = round(entry * LOSS_STOP_MULTIPLIER, 2)
+            tp_pnl  = round((entry - tp_val) * 100 * cts)
+            sl_pnl  = round((sl_val - entry) * 100 * cts)
+            tp_line = f'TP <${tp_val:.2f} (+${tp_pnl})'
+            sl_line = f'SL >${sl_val:.2f} (-${sl_pnl})'
 
-        # Assemble block (HTML — no markdown italic issues)
-        block  = f'\n<b>#{t["id"]} {symbol} — {strat} x{cts}</b>\n'
-        block += f'Spot: {spot_str} | DTE: {dte} | IVR: {t.get("ivr","?")} | Bias: {t.get("bias","?")}\n'
-        if strikes_str:
-            block += f'Strikes: {strikes_str}\n'
+        # ── Entry context ─────────────────────────────────────
+        ivr  = t.get('ivr')
+        iv   = t.get('avg_iv') or t.get('entry_iv')
+        bias = t.get('bias') or ''
+        opened_at = (t.get('opened_at') or '')[:10]
+
+        legs = _fmt_legs(t, strategy)
+
+        block_lines = [f'*#{t["id"]} {symbol}* — {strat_label}']
+        block_lines.append(f'Exp: {exp_fmt}  |  {dte_line}')
+        if legs:
+            block_lines.append(legs)
+        spot_line = f'Spot: {spot_s}'
         if dist_str:
-            block += f'{dist_str}\n'
-        cr_label = 'Debit' if is_debit else 'Credit'
-        block += f'{cr_label}: ${entry:.2f} | Val: {val_str} | P&L: {pnl_str}\n'
-        if tp_sl:
-            block += tp_sl
+            spot_line += f'  ·  {dist_str}'
+        block_lines.append(spot_line)
+        block_lines.append(f'{entry_lbl} ${entry:.2f} → {val_str}  |  P&L: {pnl_str}{warn_stop}')
+        block_lines.append(f'{tp_line}  |  {sl_line}')
 
-        lines.append(block)
+        ctx = []
+        if ivr  is not None: ctx.append(f'IVR {ivr:.0f}%')
+        if iv   is not None: ctx.append(f'IV {iv:.1f}%')
+        if bias:             ctx.append(f'Bias {bias}')
+        if ctx:
+            block_lines.append('At entry: ' + ' | '.join(ctx))
+        if opened_at:
+            block_lines.append(f'Opened: {opened_at}')
 
-    await update.message.reply_text('\n'.join(lines), parse_mode='HTML')
+        try:
+            await update.message.reply_text('\n'.join(block_lines), parse_mode='Markdown')
+        except Exception as _e:
+            await update.message.reply_text(f'⚠️ {symbol} — display error: {str(_e)[:80]}')
 
 
 async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
