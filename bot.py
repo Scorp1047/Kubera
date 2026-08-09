@@ -32,7 +32,7 @@ from config import (
     WATCHLIST, MAX_POSITIONS, MAX_SECTOR_POSITIONS,
     DTE_MIN, DTE_MAX, DTE_SWEET_SPOT, DTE_EXIT,
     PROFIT_TARGET_CREDIT, PROFIT_TARGET_DEBIT, PROFIT_TARGET_CALENDAR,
-    LOSS_STOP_MULTIPLIER, DEBIT_HARD_STOP_PCT,
+    LOSS_STOP_MULTIPLIER, DEBIT_HARD_STOP_PCT, CAL_HARD_STOP_PCT,
     CAL_DTE_FRONT, CAL_DTE_BACK, CAL_IV_MAX,
     CAL_IVR_MIN, CAL_VIX_OVERRIDE, CAL_BLACKLIST, CAL_MAX_OPEN,
     CREDIT_MIN_RATIO, EMA_TREND_PERIOD,
@@ -584,7 +584,7 @@ async def get_options_data(symbol, vix_dir='unknown', vix_value=20.0, tt_cache=N
         for opt in options:
             strike  = float(opt.strike_price)
             otm_pct = abs(strike - price) / price
-            if 0.05 <= otm_pct <= 0.45:
+            if 0.02 <= otm_pct <= 0.45:
                 candidate_opts.append(opt)
                 if opt.option_type.value == 'C':
                     call_map[opt.symbol] = {'strike': strike, 'opt': opt,
@@ -701,6 +701,20 @@ def select_strategy(ivr_regime, bias, data):
         elif bias == 'BEAR':
             return 'call_credit_spread', '', f'HIGH IVR ({data["ivr"]:.0f}%) + BEAR → call credit spread'
         else:
+            # In a trending market IC will be blocked — fall back to a directional spread
+            # that shorts into the safe side instead of killing the symbol entirely.
+            ema20     = data.get('ema20')
+            slope_up  = data.get('ema_slope_up')
+            price_now = data.get('price', 0.0)
+            if ema20 and ema20 > 0 and slope_up is not None:
+                if (price_now > ema20) and (slope_up is True):
+                    return 'put_credit_spread', '', (
+                        f'HIGH IVR ({data["ivr"]:.0f}%) + NEUTRAL + uptrend → put credit spread'
+                    )
+                if (price_now < ema20) and (slope_up is False):
+                    return 'call_credit_spread', '', (
+                        f'HIGH IVR ({data["ivr"]:.0f}%) + NEUTRAL + downtrend → call credit spread'
+                    )
             return 'iron_condor', '', f'HIGH IVR ({data["ivr"]:.0f}%) + NEUTRAL → iron condor'
 
     elif ivr_regime == 'MEDIUM':
@@ -709,7 +723,20 @@ def select_strategy(ivr_regime, bias, data):
         elif bias == 'BEAR':
             return 'call_credit_spread', '', f'MEDIUM IVR ({data["ivr"]:.0f}%) + BEAR → call credit spread'
         else:
-            return 'skip', '', f'MEDIUM IVR ({data["ivr"]:.0f}%) + NEUTRAL → SKIP (insufficient premium)'
+            # Previously skipped MEDIUM+NEUTRAL — give it a shot with the same trend-gate logic.
+            ema20     = data.get('ema20')
+            slope_up  = data.get('ema_slope_up')
+            price_now = data.get('price', 0.0)
+            if ema20 and ema20 > 0 and slope_up is not None:
+                if (price_now > ema20) and (slope_up is True):
+                    return 'put_credit_spread', '', (
+                        f'MEDIUM IVR ({data["ivr"]:.0f}%) + NEUTRAL + uptrend → put credit spread'
+                    )
+                if (price_now < ema20) and (slope_up is False):
+                    return 'call_credit_spread', '', (
+                        f'MEDIUM IVR ({data["ivr"]:.0f}%) + NEUTRAL + downtrend → call credit spread'
+                    )
+            return 'iron_condor', '', f'MEDIUM IVR ({data["ivr"]:.0f}%) + NEUTRAL → iron condor'
 
     elif ivr_regime == 'LOW':
         if move_5d <= -BIAS_MOVE_THRESHOLD * 100:
@@ -1071,7 +1098,15 @@ def validate_entry(data, strategy, sub_type, earnings_cache, open_positions):
     if strategy == 'calendar_spread':
         vix_now = data.get('vix_value', 20.0)
 
-        # 2a. IVR floor
+        # 2a. IV ceiling — calendars need LOW IV to enter; high IV has more room to collapse
+        avg_iv = data.get('avg_iv', 0.0)
+        if avg_iv > 0 and avg_iv > CAL_IV_MAX:
+            failures.append(
+                f'Calendar IV too high: {avg_iv:.1f}% > {CAL_IV_MAX:.0f}% — IV must be low to buy vol cheap'
+            )
+            return False, failures
+
+        # 2b. IVR floor
         if ivr < CAL_IVR_MIN:
             failures.append(f'Calendar IVR floor: IVR {ivr:.0f}% < {CAL_IVR_MIN:.0f}% minimum')
             return False, failures
@@ -1255,7 +1290,7 @@ def build_signal(data, strategy, sub_type, balance, call_spread_width=5.0):
             call_credit  = best_call.get('bid', 0.0)
             call_strike  = best_call.get('strike', 0.0)
             total_credit = round(put_credit + call_credit, 2)
-            bpr_per_contract = (wing_width - put_credit) * 100
+            bpr_per_contract = (wing_width - total_credit) * 100
             contracts        = calculate_size(balance, bpr_per_contract)
             if contracts == 0:
                 return None
@@ -1346,6 +1381,9 @@ def build_signal(data, strategy, sub_type, balance, call_spread_width=5.0):
         })
 
     elif strategy == 'calendar_spread':
+        # SIZING ESTIMATE ONLY — never used as the recorded entry price.
+        # tt_place_calendar_spread fetches real bid/ask and returns the true debit.
+        # _execute_signal replaces est_debit with the real price before DB recording.
         est_debit        = round(price * 0.015, 2)
         bpr_per_contract = est_debit * 100
         contracts        = calculate_size(balance, bpr_per_contract)
@@ -1353,11 +1391,12 @@ def build_signal(data, strategy, sub_type, balance, call_spread_width=5.0):
             return None
         max_loss         = round(bpr_per_contract * contracts, 2)
         sig.update({
+            'sub_type':          'call',   # stored as direction in DB; used by monitor to price the right leg
             'est_debit':         est_debit,
             'contracts':         contracts,
             'max_loss':          max_loss,
             'profit_target_pct': PROFIT_TARGET_CALENDAR,
-            'loss_stop_pct':     0.50,
+            'loss_stop_pct':     CAL_HARD_STOP_PCT,
         })
 
     else:
@@ -1828,6 +1867,8 @@ def build_calendar_spread(data, signal):
 
     atm_strike = round(round(price / interval) * interval, 2)
     contracts  = signal.get('contracts', 1)
+    # SIZING ESTIMATE ONLY — never reaches the DB as the entry price.
+    # _execute_signal overwrites est_debit with the real market debit after placement.
     est_debit  = round(price * 0.015, 2)
     max_loss   = round(est_debit * 100 * contracts, 2)
 
@@ -2090,74 +2131,80 @@ async def _close_trade(trade, reason: str, pnl: float,
     credit      = float(trade['credit_debit'] or 0)
     dte_at_close = (expiry - date.today()).days if expiry else None
 
-    result = {'error': 'strategy not matched', 'status': 'FAILED'}
+    if dry_run:
+        # Paper mode: positions exist only in Kubera DB, not in TT's live account.
+        # Sending a close order to TT (even as dry_run validation) fails with margin_check_failed
+        # because TT has no matching open position to offset. Skip TT entirely.
+        log.info(f'Close (paper): {symbol} {strategy} id={trade["id"]} reason={reason}')
+    else:
+        result = {'error': 'strategy not matched', 'status': 'FAILED'}
 
-    try:
-        if strategy in ('put_credit_spread', 'call_credit_spread'):
-            opt_type    = 'put' if 'put' in strategy else 'call'
-            sell_strike = float(trade['sell_strike'] or 0)
-            buy_strike  = float(trade['buy_strike']  or 0)
-            result = await tt.tt_close_position(
-                symbol=symbol, expiry=expiry,
-                sell_strike=sell_strike, buy_strike=buy_strike,
-                option_type=opt_type, debit=round(current_value or 0, 2),
-                contracts=contracts, dry_run=dry_run,
-            )
+        try:
+            if strategy in ('put_credit_spread', 'call_credit_spread'):
+                opt_type    = 'put' if 'put' in strategy else 'call'
+                sell_strike = float(trade['sell_strike'] or 0)
+                buy_strike  = float(trade['buy_strike']  or 0)
+                result = await tt.tt_close_position(
+                    symbol=symbol, expiry=expiry,
+                    sell_strike=sell_strike, buy_strike=buy_strike,
+                    option_type=opt_type, debit=round(current_value or 0, 2),
+                    contracts=contracts, dry_run=dry_run,
+                )
 
-        elif strategy == 'iron_condor':
-            result = await tt.tt_close_iron_condor(
-                symbol=symbol, expiry=expiry,
-                sell_put=float(trade['sell_strike_put'] or 0),
-                buy_put=float(trade['buy_strike_put']   or 0),
-                sell_call=float(trade['sell_strike']    or 0),
-                buy_call=float(trade['buy_strike']      or 0),
-                debit=round(current_value or 0, 2),
-                contracts=contracts, dry_run=dry_run,
-            )
+            elif strategy == 'iron_condor':
+                result = await tt.tt_close_iron_condor(
+                    symbol=symbol, expiry=expiry,
+                    sell_put=float(trade['sell_strike_put'] or 0),
+                    buy_put=float(trade['buy_strike_put']   or 0),
+                    sell_call=float(trade['sell_strike']    or 0),
+                    buy_call=float(trade['buy_strike']      or 0),
+                    debit=round(current_value or 0, 2),
+                    contracts=contracts, dry_run=dry_run,
+                )
 
-        elif strategy == 'jade_lizard':
-            result = await tt.tt_close_jade_lizard(
-                symbol=symbol, expiry=expiry,
-                sell_put=float(trade['sell_strike_put'] or 0),
-                sell_call=float(trade['sell_call']      or 0),
-                buy_call=float(trade['buy_strike']      or 0),
-                debit=round(current_value or 0, 2),
-                contracts=contracts, dry_run=dry_run,
-            )
+            elif strategy == 'jade_lizard':
+                result = await tt.tt_close_jade_lizard(
+                    symbol=symbol, expiry=expiry,
+                    sell_put=float(trade['sell_strike_put'] or 0),
+                    sell_call=float(trade['sell_call']      or 0),
+                    buy_call=float(trade['buy_strike']      or 0),
+                    debit=round(current_value or 0, 2),
+                    contracts=contracts, dry_run=dry_run,
+                )
 
-        elif strategy == 'debit_spread':
-            result = await tt.tt_close_debit_spread(
-                symbol=symbol, expiry=expiry,
-                buy_strike=float(trade['buy_strike']   or 0),
-                sell_strike=float(trade['sell_strike'] or 0),
-                option_type=str(trade.get('direction', 'call')).lower(),
-                credit=round(current_value or 0, 2),
-                contracts=contracts, dry_run=dry_run,
-            )
+            elif strategy == 'debit_spread':
+                result = await tt.tt_close_debit_spread(
+                    symbol=symbol, expiry=expiry,
+                    buy_strike=float(trade['buy_strike']   or 0),
+                    sell_strike=float(trade['sell_strike'] or 0),
+                    option_type=str(trade.get('direction', 'call')).lower(),
+                    credit=round(current_value or 0, 2),
+                    contracts=contracts, dry_run=dry_run,
+                )
 
-        elif strategy == 'calendar_spread':
-            near_expiry = date.fromisoformat(trade['near_expiry']) if trade.get('near_expiry') else expiry
-            far_expiry  = date.fromisoformat(trade['far_expiry'])  if trade.get('far_expiry')  else expiry
-            result = await tt.tt_close_calendar_spread(
-                symbol=symbol,
-                near_expiry=near_expiry, far_expiry=far_expiry,
-                strike=float(trade['sell_strike'] or 0),
-                option_type=str(trade.get('direction', 'call')).lower(),
-                credit=round(current_value or 0, 2),
-                contracts=contracts, dry_run=dry_run,
-            )
+            elif strategy == 'calendar_spread':
+                near_expiry = date.fromisoformat(trade['near_expiry']) if trade.get('near_expiry') else expiry
+                far_expiry  = date.fromisoformat(trade['far_expiry'])  if trade.get('far_expiry')  else expiry
+                result = await tt.tt_close_calendar_spread(
+                    symbol=symbol,
+                    near_expiry=near_expiry, far_expiry=far_expiry,
+                    strike=float(trade['sell_strike'] or 0),
+                    option_type=str(trade.get('direction', 'call')).lower(),
+                    credit=round(current_value or 0, 2),
+                    contracts=contracts, dry_run=dry_run,
+                )
 
-        else:
-            log.warning(f'Unknown strategy for close: {strategy} ({symbol})')
+            else:
+                log.warning(f'Unknown strategy for close: {strategy} ({symbol})')
+                return False
+
+        except Exception as e:
+            log.error(f'Close execution error {symbol} {strategy}: {e}')
             return False
 
-    except Exception as e:
-        log.error(f'Close execution error {symbol} {strategy}: {e}')
-        return False
-
-    if result.get('error') or result.get('status') == 'FAILED':
-        log.error(f'Close order failed: {symbol} {strategy} — {result.get("error")}')
-        return False
+        if result.get('error') or result.get('status') == 'FAILED':
+            log.error(f'Close order failed: {symbol} {strategy} — {result.get("error")}')
+            return False
 
     cv = float(current_value or 0)
     cr = float(credit)
@@ -2255,9 +2302,9 @@ async def _monitor_one(trade, vix=None, dry_run: bool = False) -> dict:
     result['spot']  = spot
     result['trade'] = dict(trade)
 
-    # DTE EXIT (21 DTE)
+    # DTE EXIT (21 DTE) — skip for calendars: their own 5-DTE near-leg exit handles it
     dte_exit = int(DTE_EXIT)
-    if dte_remaining is not None and dte_remaining <= dte_exit:
+    if dte_remaining is not None and dte_remaining <= dte_exit and not is_calendar:
         if current_value is not None:
             closed = await _close_trade(
                 trade, reason='dte_exit', pnl=result.get('pnl_approx', 0),
@@ -2340,7 +2387,8 @@ async def _monitor_one(trade, vix=None, dry_run: bool = False) -> dict:
             profit_target = round(debit_paid * (1 + PROFIT_TARGET_CALENDAR), 4)
         else:
             profit_target = round(debit_paid * (1 + PROFIT_TARGET_DEBIT), 4)
-        hard_stop = round(debit_paid * (1 - DEBIT_HARD_STOP_PCT), 4)
+        stop_pct  = CAL_HARD_STOP_PCT if is_calendar else DEBIT_HARD_STOP_PCT
+        hard_stop = round(debit_paid * (1 - stop_pct), 4)
 
         if cv >= profit_target:
             closed = await _close_trade(
@@ -2360,7 +2408,8 @@ async def _monitor_one(trade, vix=None, dry_run: bool = False) -> dict:
             )
             if closed:
                 result['action'] = 'closed'
-                result['reason'] = f'50% debit hard stop (paid={debit_paid:.2f} → value={cv:.2f})'
+                result['reason'] = (f'{stop_pct*100:.0f}% debit hard stop '
+                                    f'(paid={debit_paid:.2f} → value={cv:.2f})')
                 return result
 
         if is_calendar and dte_remaining is not None and dte_remaining <= dte_exit_cal:
@@ -2376,13 +2425,14 @@ async def _monitor_one(trade, vix=None, dry_run: bool = False) -> dict:
     return result
 
 
-async def monitor_positions(send_telegram=None, dry_run: bool = False):
-    """Main monitor entry point. Called every 30 min by APScheduler."""
+async def monitor_positions(send_telegram=None, dry_run: bool = False, force: bool = False):
+    """Main monitor entry point. Called every 30 min by APScheduler.
+    force=True bypasses the weekday gate (used by manual /monitor command)."""
     now = datetime.now(ET)
     is_weekday  = now.weekday() < 5
     market_hour = (9 <= now.hour < 16) or (now.hour == 16 and now.minute == 0)
 
-    if not is_weekday:
+    if not is_weekday and not force:
         log.debug('Monitor: weekend — skipping')
         return []
 
@@ -2782,21 +2832,32 @@ async def cmd_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def _fmt_scan_trade(t: dict) -> str:
     """Format one newly-placed trade for the post-scan new-trades block (HTML)."""
     from datetime import date as _date
-    symbol    = t.get('symbol', '?')
-    strategy  = t.get('strategy', '')
-    contracts = int(t.get('contracts') or 1)
-    cr        = float(t.get('credit_debit') or 0)   # negative = debit
-    max_loss  = float(t.get('max_loss') or 0)
-    spot      = float(t.get('spot_price') or 0)
-    mode_s    = t.get('mode') or 'paper'
+
+    symbol       = t.get('symbol', '?')
+    strategy     = t.get('strategy', '')
+    contracts    = int(t.get('contracts') or 1)
+    cr           = float(t.get('credit_debit') or 0)
+    max_loss     = float(t.get('max_loss') or 0)
+    spot         = float(t.get('spot_price') or 0)
+    mode_s       = t.get('mode') or 'paper'
+    ivr          = t.get('ivr')
+    ivr_regime   = (t.get('ivr_regime') or '').upper()
+    avg_iv       = t.get('avg_iv')
+    vix          = t.get('vix_at_entry')
+    bias         = (t.get('bias') or '').upper()
+    bias_reason  = t.get('bias_reason') or ''
+    dte          = t.get('dte_at_open')
+    capital      = float(t.get('capital_used') or abs(cr) * 100 * contracts)
+    strat_reason = t.get('strat_reason', '')
+    ai_reason    = t.get('ai_reason', '')
 
     strat_labels = {
-        'iron_condor':       'Iron Condor',
-        'put_credit_spread': 'Put Spread',
-        'call_credit_spread':'Call Spread',
-        'jade_lizard':       'Jade Lizard',
-        'debit_spread':      'Debit Spread',
-        'calendar_spread':   'Calendar',
+        'iron_condor':        'Iron Condor',
+        'put_credit_spread':  'Put Spread',
+        'call_credit_spread': 'Call Spread',
+        'jade_lizard':        'Jade Lizard',
+        'debit_spread':       'Debit Spread',
+        'calendar_spread':    'Calendar',
     }
     strat_label = strat_labels.get(strategy, strategy)
 
@@ -2807,41 +2868,84 @@ def _fmt_scan_trade(t: dict) -> str:
             return s or '?'
 
     is_debit = cr < 0
-    cr_label = f'Debit ${abs(cr):.2f}' if is_debit else f'Credit ${cr:.2f}'
-    loss_label = f'Max loss ${abs(max_loss):.0f}' if max_loss else ''
+    dte_tag  = f'  ·  {dte} DTE' if dte else ''
 
+    # ── Leg detail ─────────────────────────────────────────────────
     if strategy == 'calendar_spread':
         near_s = _d(t.get('near_expiry') or '')
         far_s  = _d(t.get('far_expiry')  or '')
         spot_s = f'${spot:.0f}' if spot else ''
-        detail = f'ATM {spot_s}  ·  {near_s} → {far_s}'
+        detail = f'ATM {spot_s}  ·  {near_s} → {far_s}{dte_tag}'
     elif strategy == 'iron_condor':
         sp = t.get('sell_strike_put') or 0
         bp = t.get('buy_strike_put')  or 0
         sc = t.get('sell_call')       or 0
         bc = t.get('buy_strike')      or 0
         detail = (f'{bp:.0f}P / <b>{sp:.0f}P</b>  ·  '
-                  f'<b>{sc:.0f}C</b> / {bc:.0f}C')
+                  f'<b>{sc:.0f}C</b> / {bc:.0f}C{dte_tag}')
     elif strategy == 'jade_lizard':
         sp = t.get('sell_strike_put') or t.get('sell_strike') or 0
         sc = t.get('sell_call') or 0
         bc = t.get('buy_strike') or 0
-        detail = f'Put <b>{sp:.0f}P</b>  ·  Calls <b>{sc:.0f}C</b>/{bc:.0f}C'
+        detail = f'Put <b>{sp:.0f}P</b>  ·  Calls <b>{sc:.0f}C</b>/{bc:.0f}C{dte_tag}'
     else:
         ss  = t.get('sell_strike') or t.get('sell_call') or 0
         bs  = t.get('buy_strike') or 0
         exp = _d(t.get('expiry') or '')
         opt = 'C' if 'call' in strategy else 'P'
-        detail = f'<b>{ss:.0f}{opt}</b> / {bs:.0f}{opt}  ·  {exp}'
+        detail = f'<b>{ss:.0f}{opt}</b> / {bs:.0f}{opt}  ·  {exp}{dte_tag}'
 
-    ai_reason = t.get('ai_reason', '')
+    # ── P&L labels ─────────────────────────────────────────────────
+    cr_label  = f'Debit ${abs(cr):.2f}' if is_debit else f'Credit ${cr:.2f}'
+    cap_label = f'Capital ${capital:.0f}'
 
+    # ── TP / SL ────────────────────────────────────────────────────
+    debit_paid = abs(cr)
+    if is_debit:
+        is_calendar = strategy == 'calendar_spread'
+        pt_pct = PROFIT_TARGET_CALENDAR if is_calendar else PROFIT_TARGET_DEBIT
+        tp_val = round(debit_paid * (1 + pt_pct), 2)
+        sl_val = round(debit_paid * (1 - DEBIT_HARD_STOP_PCT), 2)
+        tp_pnl = round((tp_val - debit_paid) * 100 * contracts)
+        sl_pnl = round((debit_paid - sl_val) * 100 * contracts)
+        tp_sl = f'TP &gt;${tp_val:.2f} (+${tp_pnl})  ·  SL &lt;${sl_val:.2f} (-${sl_pnl})'
+    else:
+        tp_val = round(cr * (1 - PROFIT_TARGET_CREDIT), 2)
+        sl_val = round(cr * LOSS_STOP_MULTIPLIER, 2)
+        tp_pnl = round((cr - tp_val) * 100 * contracts)
+        sl_pnl = round((sl_val - cr) * 100 * contracts)
+        tp_sl = f'TP &lt;${tp_val:.2f} (+${tp_pnl})  ·  SL &gt;${sl_val:.2f} (-${sl_pnl})'
+
+    # ── Market context ─────────────────────────────────────────────
+    ivr_s  = f'IVR {ivr:.1f}% {ivr_regime}'.strip() if ivr is not None else ''
+    iv_s   = f'IV {avg_iv:.1f}%' if avg_iv else ''
+    vix_s  = f'VIX {vix:.1f}' if vix is not None else ''
+    spot_s = f'Spot ${spot:.2f}' if spot else ''
+    ctx_parts = [p for p in [ivr_s, iv_s, vix_s, spot_s] if p]
+    ctx_line  = '  ·  '.join(ctx_parts)
+
+    # ── Bias line ──────────────────────────────────────────────────
+    br = bias_reason
+    if br.startswith('[') and ']' in br:
+        br = br[br.find(']') + 1:].strip()
+    if len(br) > 100:
+        br = br[:97] + '...'
+    bias_line = f'Bias: {bias}' + (f' — {br}' if br else '')
+
+    # ── Assemble ────────────────────────────────────────────────────
     mode_tag = '  <i>[paper]</i>' if mode_s == 'paper' else ''
     lines = [
         f'<b>{symbol}</b>  {strat_label} ×{contracts}{mode_tag}',
         f'  {detail}',
-        f'  {cr_label}  ·  {loss_label}',
+        f'  {cr_label}  ·  {cap_label}' + (f'  ·  Max loss ${abs(max_loss):.0f}' if not is_debit and max_loss else ''),
+        f'  {tp_sl}',
     ]
+    if ctx_line:
+        lines.append(f'  {ctx_line}')
+    if bias_line:
+        lines.append(f'  {bias_line}')
+    if strat_reason:
+        lines.append(f'  Why: <i>{strat_reason}</i>')
     if ai_reason:
         lines.append(f'  🤖 <i>{ai_reason}</i>')
     return '\n'.join(lines)
@@ -3045,7 +3149,7 @@ async def cmd_monitor(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await _deny(update)
     await update.message.reply_text('🔄 Running monitor cycle...')
     try:
-        results = await run_monitor()
+        results = await run_monitor(force=True)
         now         = datetime.now(ET)
         market_open = (9 <= now.hour < 16) or (now.hour == 16 and now.minute == 0)
         mode        = db.get_state('mode') or 'paper'
@@ -3153,6 +3257,12 @@ async def sync_balance():
 
 async def _place_order(order: dict, dry_run: bool = True) -> dict | None:
     """Route order dict to the correct TT placement function."""
+    if dry_run:
+        # Paper mode: positions don't exist in TT. Calling TT's dry-run endpoint
+        # always fails with margin_check_failed. Skip TT entirely.
+        log.info(f'_place_order (paper): {order.get("symbol")} {order.get("strategy")} — skipping TT')
+        return {'status': 'paper', 'order_id': None}
+
     strategy  = order.get('strategy', '')
     symbol    = order.get('symbol', '')
     contracts = int(order.get('contracts', 1))
@@ -3290,6 +3400,26 @@ async def _execute_signal(order: dict, signal: dict, data: dict,
     order_id = result.get('order_id')
     status   = result.get('status', 'unknown')
     log.info(f'Order placed: {symbol} id={order_id} status={status}')
+
+    # Calendar: replace synthetic price×0.015 estimate with real market debit from placement.
+    # tt_place_calendar_spread fetches actual bid/ask and returns the real debit in result['debit'].
+    # Must happen before _build_record_kwargs so the DB, stop, target, and TG output
+    # all use the real entry price instead of the formula estimate.
+    if strategy == 'calendar_spread' and result.get('debit'):
+        real_debit = float(result['debit'])
+        old_est    = float(order.get('est_debit', 0))
+        order['est_debit'] = real_debit
+        order['max_loss']  = round(real_debit * 100 * contracts, 2)
+        deviation_pct = round(abs(real_debit - old_est) / max(old_est, 0.01) * 100)
+        log.info(
+            f'Calendar {symbol}: debit corrected est=${old_est:.2f} → real=${real_debit:.2f} '
+            f'({deviation_pct}% deviation from formula)'
+        )
+        if deviation_pct > 50:
+            log.warning(
+                f'Calendar {symbol}: large debit deviation ({deviation_pct}%) — '
+                f'formula price×0.015 is unreliable at current IV. Real debit used.'
+            )
 
     kwargs = _build_record_kwargs(order, signal, data)
     try:
@@ -3439,7 +3569,8 @@ async def run_scan():
     skipped     = 0
     errors      = 0
     open_now    = open_count
-    ai_reasons  = {}   # symbol → ai_reason for post-scan TG block
+    ai_reasons    = {}   # symbol → ai_reason for post-scan TG block
+    strat_reasons = {}   # symbol → strat_reason for post-scan TG block
 
     for symbol in symbols:
         if open_now >= MAX_POSITIONS:
@@ -3452,7 +3583,7 @@ async def run_scan():
 
         try:
             data = await get_options_data(symbol, vix_dir=vix_dir,
-                                          vix_value=vix_data.get('vix', 20.0),
+                                          vix_value=(vix_data.get('vix', 20.0) if vix_data else 20.0),
                                           tt_cache=tt_cache)
             if data is None:
                 skipped += 1
@@ -3549,7 +3680,12 @@ async def run_scan():
                 open_now += 1
                 sector_counts[sector] = sector_counts.get(sector, 0) + 1
                 traded_today.add(symbol)
-                ai_reasons[symbol] = signal.get('ai_reason', '')
+                ai_reasons[symbol]    = signal.get('ai_reason', '')
+                strat_reasons[symbol] = strat_reason
+                # Keep open_trades current so validate_entry sees new positions
+                # placed earlier in this same scan (dedup + sector + calendar cap checks).
+                open_trades = list(open_trades)
+                open_trades.append({'symbol': symbol, 'status': 'open', 'strategy': strategy})
             else:
                 errors += 1
 
@@ -3576,7 +3712,9 @@ async def run_scan():
                 rows_with_ai = []
                 for r in new_rows:
                     row = dict(r)
-                    row['ai_reason'] = ai_reasons.get(row.get('symbol', ''), '')
+                    sym = row.get('symbol', '')
+                    row['ai_reason']    = ai_reasons.get(sym, '')
+                    row['strat_reason'] = strat_reasons.get(sym, '')
                     rows_with_ai.append(row)
                 lines = [_fmt_scan_trade(r) for r in rows_with_ai]
                 block = f'📋 <b>Trades opened ({len(new_rows)}):</b>\n\n' + '\n\n'.join(lines)
@@ -3587,11 +3725,11 @@ async def run_scan():
 
 # ── Monitor wrapper ─────────────────────────────────────────────────
 
-async def run_monitor():
+async def run_monitor(force: bool = False):
     mode    = db.get_state('mode') or 'paper'
     dry_run = (mode != 'live')
     try:
-        results = await monitor_positions(send_telegram=tg, dry_run=dry_run)
+        results = await monitor_positions(send_telegram=tg, dry_run=dry_run, force=force)
         return results or []
     except Exception as e:
         log.error(f'Monitor exception: {e}', exc_info=True)

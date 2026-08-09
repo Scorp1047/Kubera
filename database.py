@@ -269,7 +269,7 @@ def record_trade(signal, data, mode='paper'):
         signal.get('sub_type', 'neutral'),
         data.get('ivr'), data.get('ivr_regime'),
         data.get('bias'), data.get('bias_reason'),
-        data.get('vix'), data.get('avg_iv'),
+        data.get('vix_value'), data.get('avg_iv'),
         data.get('em_dollar'), data.get('em_pct'),
         data.get('sector', 'Unknown'),
         data.get('earnings', [''])[0] if data.get('earnings') else None,
@@ -531,7 +531,7 @@ def symbols_today() -> set:
 
 def check_guardrails():
     """Returns (can_trade: bool, reason: str). Call at start of every scan."""
-    from config import MAX_CAPITAL_DEPLOYED
+    from config import MAX_CAPITAL_DEPLOYED, CONSEC_LOSS_PAUSE
     now     = datetime.now(ET)
     balance = get_current_balance()
 
@@ -597,6 +597,12 @@ def check_guardrails():
                     return False, f'PEAK DRAWDOWN -{drop_pct:.1f}%: 48h pause'
         except Exception:
             pass
+
+    # Consecutive loss pause
+    losses = int(get_state('consecutive_losses') or 0)
+    if losses >= CONSEC_LOSS_PAUSE:
+        return False, (f'CONSEC LOSS PAUSE: {losses} consecutive losses — '
+                       f'reassess conditions before resuming')
 
     return True, 'ok'
 
