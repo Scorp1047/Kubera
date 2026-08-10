@@ -2302,6 +2302,24 @@ async def _monitor_one(trade, vix=None, dry_run: bool = False) -> dict:
     result['spot']  = spot
     result['trade'] = dict(trade)
 
+    # ── Current IV / IVR ─────────────────────────────────────────
+    iv_now, ivr_now = None, None
+    try:
+        _metrics = await tt.tt_get_metrics_batch([symbol])
+        _m = _metrics.get(symbol)
+        if _m:
+            if _m.implied_volatility_30_day:
+                iv_now = round(float(_m.implied_volatility_30_day), 1)
+            elif _m.implied_volatility_index:
+                _raw = float(_m.implied_volatility_index)
+                iv_now = round(_raw if _raw > 2 else _raw * 100, 1)
+            if _m.implied_volatility_index_rank is not None:
+                ivr_now = round(float(_m.implied_volatility_index_rank) * 100, 1)
+    except Exception as _e:
+        log.debug(f'Monitor IV/IVR fetch {symbol}: {str(_e)[:50]}')
+    result['iv_now']  = iv_now
+    result['ivr_now'] = ivr_now
+
     # DTE EXIT (21 DTE) — skip for calendars: their own 5-DTE near-leg exit handles it
     dte_exit = int(DTE_EXIT)
     if dte_remaining is not None and dte_remaining <= dte_exit and not is_calendar:
@@ -2829,10 +2847,49 @@ async def cmd_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+def _bet_description(t: dict, strategy: str) -> str:
+    """One-line plain-English description of what the trade is betting on."""
+    symbol = t.get('symbol', '?')
+    def _s(v): return f'${float(v):.0f}' if v else '?'
+    def _d(s):
+        try: return date.fromisoformat(s).strftime('%b %-d')
+        except Exception: return s or '?'
+
+    if strategy == 'calendar_spread':
+        strike = t.get('sell_strike') or t.get('sell_call') or t.get('buy_strike')
+        near   = _d(t.get('near_expiry') or '')
+        return (f'{symbol} stays near {_s(strike)} while IV rises into {near}. '
+                f'Near leg decays faster \u2192 spread widens \u2192 profit.')
+    elif strategy == 'iron_condor':
+        sp = _s(t.get('sell_strike_put'))
+        sc = _s(t.get('sell_strike') or t.get('sell_call'))
+        return (f'{symbol} stays between {sp} and {sc} through expiry. '
+                f'Both sides decay \u2192 full premium collected.')
+    elif strategy == 'put_credit_spread':
+        sp  = _s(t.get('sell_strike_put') or t.get('sell_strike'))
+        exp = _d(t.get('expiry') or '')
+        return f'{symbol} stays above {sp} through {exp}. Sold put expires worthless \u2192 full premium.'
+    elif strategy == 'call_credit_spread':
+        sc  = _s(t.get('sell_strike') or t.get('sell_call'))
+        exp = _d(t.get('expiry') or '')
+        return f'{symbol} stays below {sc} through {exp}. Sold call expires worthless \u2192 full premium.'
+    elif strategy == 'debit_spread':
+        direction = str(t.get('direction', '')).lower()
+        bc  = _s(t.get('buy_strike'))
+        exp = _d(t.get('expiry') or '')
+        if 'call' in direction:
+            return f'{symbol} rises above {bc} before {exp}. Long call gains more than short call loses.'
+        else:
+            return f'{symbol} falls below {bc} before {exp}. Long put gains more than short put loses.'
+    elif strategy == 'jade_lizard':
+        sp = _s(t.get('sell_strike_put'))
+        sc = _s(t.get('sell_strike') or t.get('sell_call'))
+        return f'{symbol} stays above {sp} and below {sc} through expiry.'
+    return ''
+
+
 def _fmt_scan_trade(t: dict) -> str:
     """Format one newly-placed trade for the post-scan new-trades block (HTML)."""
-    from datetime import date as _date
-
     symbol       = t.get('symbol', '?')
     strategy     = t.get('strategy', '')
     contracts    = int(t.get('contracts') or 1)
@@ -2841,11 +2898,8 @@ def _fmt_scan_trade(t: dict) -> str:
     spot         = float(t.get('spot_price') or 0)
     mode_s       = t.get('mode') or 'paper'
     ivr          = t.get('ivr')
-    ivr_regime   = (t.get('ivr_regime') or '').upper()
-    avg_iv       = t.get('avg_iv')
     vix          = t.get('vix_at_entry')
     bias         = (t.get('bias') or '').upper()
-    bias_reason  = t.get('bias_reason') or ''
     dte          = t.get('dte_at_open')
     capital      = float(t.get('capital_used') or abs(cr) * 100 * contracts)
     strat_reason = t.get('strat_reason', '')
@@ -2853,101 +2907,68 @@ def _fmt_scan_trade(t: dict) -> str:
 
     strat_labels = {
         'iron_condor':        'Iron Condor',
-        'put_credit_spread':  'Put Spread',
-        'call_credit_spread': 'Call Spread',
+        'put_credit_spread':  'Put Credit Spread',
+        'call_credit_spread': 'Call Credit Spread',
         'jade_lizard':        'Jade Lizard',
         'debit_spread':       'Debit Spread',
-        'calendar_spread':    'Calendar',
+        'calendar_spread':    'Calendar Spread',
     }
     strat_label = strat_labels.get(strategy, strategy)
-
-    def _d(s):
-        try:
-            return _date.fromisoformat(s).strftime('%-d %b')
-        except Exception:
-            return s or '?'
-
-    is_debit = cr < 0
-    dte_tag  = f'  ·  {dte} DTE' if dte else ''
-
-    # ── Leg detail ─────────────────────────────────────────────────
-    if strategy == 'calendar_spread':
-        near_s = _d(t.get('near_expiry') or '')
-        far_s  = _d(t.get('far_expiry')  or '')
-        spot_s = f'${spot:.0f}' if spot else ''
-        detail = f'ATM {spot_s}  ·  {near_s} → {far_s}{dte_tag}'
-    elif strategy == 'iron_condor':
-        sp = t.get('sell_strike_put') or 0
-        bp = t.get('buy_strike_put')  or 0
-        sc = t.get('sell_call')       or 0
-        bc = t.get('buy_strike')      or 0
-        detail = (f'{bp:.0f}P / <b>{sp:.0f}P</b>  ·  '
-                  f'<b>{sc:.0f}C</b> / {bc:.0f}C{dte_tag}')
-    elif strategy == 'jade_lizard':
-        sp = t.get('sell_strike_put') or t.get('sell_strike') or 0
-        sc = t.get('sell_call') or 0
-        bc = t.get('buy_strike') or 0
-        detail = f'Put <b>{sp:.0f}P</b>  ·  Calls <b>{sc:.0f}C</b>/{bc:.0f}C{dte_tag}'
-    else:
-        ss  = t.get('sell_strike') or t.get('sell_call') or 0
-        bs  = t.get('buy_strike') or 0
-        exp = _d(t.get('expiry') or '')
-        opt = 'C' if 'call' in strategy else 'P'
-        detail = f'<b>{ss:.0f}{opt}</b> / {bs:.0f}{opt}  ·  {exp}{dte_tag}'
-
-    # ── P&L labels ─────────────────────────────────────────────────
-    cr_label  = f'Debit ${abs(cr):.2f}' if is_debit else f'Credit ${cr:.2f}'
-    cap_label = f'Capital ${capital:.0f}'
+    is_debit    = cr < 0
+    is_calendar = strategy == 'calendar_spread'
 
     # ── TP / SL ────────────────────────────────────────────────────
     debit_paid = abs(cr)
     if is_debit:
-        is_calendar = strategy == 'calendar_spread'
         pt_pct = PROFIT_TARGET_CALENDAR if is_calendar else PROFIT_TARGET_DEBIT
+        sl_pct = CAL_HARD_STOP_PCT if is_calendar else DEBIT_HARD_STOP_PCT
         tp_val = round(debit_paid * (1 + pt_pct), 2)
-        sl_val = round(debit_paid * (1 - DEBIT_HARD_STOP_PCT), 2)
+        sl_val = round(debit_paid * (1 - sl_pct), 2)
         tp_pnl = round((tp_val - debit_paid) * 100 * contracts)
         sl_pnl = round((debit_paid - sl_val) * 100 * contracts)
-        tp_sl = f'TP &gt;${tp_val:.2f} (+${tp_pnl})  ·  SL &lt;${sl_val:.2f} (-${sl_pnl})'
+        tp_sl  = f'TP &gt;${tp_val:.2f} (+${tp_pnl})  \u00b7  SL &lt;${sl_val:.2f} (-${sl_pnl})'
+        cr_lbl = f'Paid ${debit_paid:.2f}'
     else:
         tp_val = round(cr * (1 - PROFIT_TARGET_CREDIT), 2)
         sl_val = round(cr * LOSS_STOP_MULTIPLIER, 2)
         tp_pnl = round((cr - tp_val) * 100 * contracts)
         sl_pnl = round((sl_val - cr) * 100 * contracts)
-        tp_sl = f'TP &lt;${tp_val:.2f} (+${tp_pnl})  ·  SL &gt;${sl_val:.2f} (-${sl_pnl})'
+        tp_sl  = f'TP &lt;${tp_val:.2f} (+${tp_pnl})  \u00b7  SL &gt;${sl_val:.2f} (-${sl_pnl})'
+        cr_lbl = f'Credit ${cr:.2f}'
+
+    # ── Legs ───────────────────────────────────────────────────────
+    legs = _fmt_legs(t, strategy)
+
+    # ── THE BET ────────────────────────────────────────────────────
+    bet = _bet_description(t, strategy)
 
     # ── Market context ─────────────────────────────────────────────
-    ivr_s  = f'IVR {ivr:.1f}% {ivr_regime}'.strip() if ivr is not None else ''
-    iv_s   = f'IV {avg_iv:.1f}%' if avg_iv else ''
-    vix_s  = f'VIX {vix:.1f}' if vix is not None else ''
-    spot_s = f'Spot ${spot:.2f}' if spot else ''
-    ctx_parts = [p for p in [ivr_s, iv_s, vix_s, spot_s] if p]
-    ctx_line  = '  ·  '.join(ctx_parts)
-
-    # ── Bias line ──────────────────────────────────────────────────
-    br = bias_reason
-    if br.startswith('[') and ']' in br:
-        br = br[br.find(']') + 1:].strip()
-    if len(br) > 100:
-        br = br[:97] + '...'
-    bias_line = f'Bias: {bias}' + (f' — {br}' if br else '')
+    ctx_parts = []
+    if bias:            ctx_parts.append(f'Bias {bias}')
+    if ivr is not None: ctx_parts.append(f'IVR {ivr:.0f}%')
+    if vix is not None: ctx_parts.append(f'VIX {vix:.1f}')
+    if spot:            ctx_parts.append(f'Spot ${spot:.2f}')
+    ctx = '  \u00b7  '.join(ctx_parts)
 
     # ── Assemble ────────────────────────────────────────────────────
     mode_tag = '  <i>[paper]</i>' if mode_s == 'paper' else ''
-    lines = [
-        f'<b>{symbol}</b>  {strat_label} ×{contracts}{mode_tag}',
-        f'  {detail}',
-        f'  {cr_label}  ·  {cap_label}' + (f'  ·  Max loss ${abs(max_loss):.0f}' if not is_debit and max_loss else ''),
-        f'  {tp_sl}',
-    ]
-    if ctx_line:
-        lines.append(f'  {ctx_line}')
-    if bias_line:
-        lines.append(f'  {bias_line}')
+    dte_tag  = f'  \u00b7  {dte} DTE' if dte else ''
+    max_loss_s = f'  \u00b7  Max loss ${abs(max_loss):.0f}' if not is_debit and max_loss else ''
+
+    lines = [f'\U0001f4e5 <b>NEW TRADE \u2014 {symbol}</b>{mode_tag}', '']
+    lines.append(f'<b>{strat_label}</b>{dte_tag}')
+    if legs:
+        for leg in legs.split('\n'):
+            lines.append(f'  {leg}')
+    lines.append(f'  {cr_lbl} \u00d7 {contracts}ct (${capital:.0f})  \u00b7  {tp_sl}{max_loss_s}')
+    if bet:
+        lines += ['', f'<b>THE BET:</b> {bet}']
+    if ctx:
+        lines += ['', f'MARKET: {ctx}']
     if strat_reason:
-        lines.append(f'  Why: <i>{strat_reason}</i>')
+        lines.append(f'WHY: <i>{strat_reason}</i>')
     if ai_reason:
-        lines.append(f'  🤖 <i>{ai_reason}</i>')
+        lines.append(f'\U0001f916 <i>{ai_reason}</i>')
     return '\n'.join(lines)
 
 
@@ -3114,32 +3135,52 @@ def _fmt_position_block(r: dict) -> str:
     bias = trade.get('bias') or ''
     opened_at = (trade.get('opened_at') or '')[:10]
 
+    # ── IV / IVR trend ────────────────────────────────────────────
+    iv_entry  = trade.get('avg_iv')
+    iv_now    = r.get('iv_now')
+    ivr_entry = ivr
+    ivr_now   = r.get('ivr_now')
+
+    def _trend(entry, now, fmt):
+        if entry is None or now is None:
+            return None
+        arrow = '↑' if now > entry else ('↓' if now < entry else '→')
+        return f'{fmt(entry)} → {fmt(now)} {arrow}'
+
+    iv_trend  = _trend(iv_entry,  iv_now,  lambda x: f'{x:.1f}%')
+    ivr_trend = _trend(ivr_entry, ivr_now, lambda x: f'{x:.0f}%')
+
     legs = _fmt_legs(trade, strategy)
 
-    lines = [f'{action_icon} *{symbol}* — {strat_label}']
-    lines.append(f'Exp: {exp_fmt}  |  {dte_str}')
+    lines = [f'{action_icon} {symbol} — {strat_label}']
+    lines.append(f'  {exp_fmt}  ·  {dte_str}')
     if legs:
-        lines.append(legs)
-    spot_line = f'Spot: {spot_s}'
+        for leg in legs.split('\n'):
+            lines.append(f'  {leg}')
+    spot_line = f'  Spot: {spot_s}'
     if dist_str:
         spot_line += f'  ·  {dist_str}'
     lines.append(spot_line)
-    lines.append(f'Open: {entry_lbl} ${credit:.2f} × {contracts}ct  |  Capital: ${capital:.0f}')
-    lines.append(f'Now:  {val_s}  |  P&L: {pnl_s}{warn_stop}')
-    lines.append(f'{tp_line}  |  {sl_line}')
+    lines.append('')
+    lines.append(f'  Open: {entry_lbl} ${credit:.2f} × {contracts}ct  |  Capital: ${capital:.0f}')
+    lines.append(f'  Now:  {val_s}  |  P&L: {pnl_s}{warn_stop}')
+    lines.append(f'  {tp_line}  |  {sl_line}')
+    lines.append('')
+
+    vol_parts = []
+    if iv_trend:  vol_parts.append(f'IV: {iv_trend}')
+    if ivr_trend: vol_parts.append(f'IVR: {ivr_trend}')
+    if vol_parts:
+        lines.append('  ' + '  |  '.join(vol_parts))
 
     ctx = []
-    if ivr  is not None: ctx.append(f'IVR {ivr:.0f}%')
-    if iv   is not None: ctx.append(f'IV {iv:.1f}%')
-    if pop  is not None: ctx.append(f'POP {pop:.0f}%')
-    if bias:             ctx.append(f'Bias {bias}')
+    if bias:      ctx.append(f'Bias: {bias.upper()}')
+    if opened_at: ctx.append(f'Opened: {opened_at}')
     if ctx:
-        lines.append('At entry: ' + ' | '.join(ctx))
-    if opened_at:
-        lines.append(f'Opened: {opened_at}')
+        lines.append('  ' + '  ·  '.join(ctx))
 
     if action in ('closed', 'alert') and r.get('reason'):
-        lines.append(f'↳ {r["reason"]}')
+        lines.append(f'  ↳ {r["reason"]}')
 
     return '\n'.join(lines)
 
