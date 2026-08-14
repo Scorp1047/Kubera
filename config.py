@@ -130,7 +130,7 @@ CAL_MAX_OPEN           = 1            # max concurrent open calendar spreads
 
 PROFIT_TARGET_CREDIT    = 0.50  # credit spreads / IC / Jade Lizard / strangles: 50% of max credit
 PROFIT_TARGET_DEBIT     = 0.25  # debit spreads: 25% of debit paid (TT range 25–50%; use conservative end)
-PROFIT_TARGET_CALENDAR  = 0.15  # calendar spreads: 15% of debit paid (TT range 10–25%)
+PROFIT_TARGET_CALENDAR  = 0.25  # calendar spreads: 25% of debit paid
 PROFIT_TARGET_BUTTERFLY = 0.25  # butterflies: 25% of max profit
 
 # ═══════════════════════════════════════════════════════════════════
@@ -145,6 +145,7 @@ PROFIT_TARGET_BUTTERFLY = 0.25  # butterflies: 25% of max profit
 LOSS_STOP_MULTIPLIER   = 2.0    # close credit trade when mark loss = 2× credit received
 ROLL_POP_FLOOR         = 0.33   # roll when current POP drops below 33%
 DEBIT_HARD_STOP_PCT    = 0.50   # close debit spread if loss > 50% of debit paid
+CAL_HARD_STOP_PCT      = 0.40   # calendar spreads: tighter stop — 40% loss (calendars can gap faster)
 # Rolling rules (TastyTrade):
 # - Only roll for a credit, never for a debit
 # - Only roll if the thesis is unchanged

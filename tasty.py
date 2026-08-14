@@ -654,6 +654,20 @@ async def tt_place_calendar_spread(symbol: str,
                 raw_debit   = max(round(far_mid - near_mid, 2), 0.01)
                 # Round to nearest $0.05 tick — TT rejects multi-leg DEBIT orders at arbitrary decimals
                 order_debit = max(0.05, round(round(raw_debit / 0.05) * 0.05, 2))
+
+                # Term structure check: require contango (far_iv > near_iv + 2%).
+                # Backwardation means we'd be buying expensive far vol and selling cheap
+                # near vol — the spread is structurally unlikely to profit.
+                near_iv = near_d.get('mid_iv', 0)
+                far_iv  = far_d.get('mid_iv',  0)
+                if near_iv > 0 and far_iv > 0:
+                    log.info(f'Calendar {symbol}: term structure near_iv={near_iv:.1f}% far_iv={far_iv:.1f}%')
+                    if far_iv < near_iv + 2.0:
+                        msg = (f'Calendar {symbol}: backwardation/flat term structure '
+                               f'(near_iv={near_iv:.1f}% far_iv={far_iv:.1f}%) — skip')
+                        log.warning(msg)
+                        return {'error': msg, 'status': 'FAILED'}
+
                 greeks_ok   = True
                 log.info(f'Calendar {symbol}: real debit=${order_debit:.2f} '
                          f'(near_mid={near_mid:.2f} far_mid={far_mid:.2f}) '
@@ -692,7 +706,8 @@ async def tt_place_calendar_spread(symbol: str,
             'near_expiry': str(near_expiry),
             'far_expiry':  str(far_expiry),
             'type':        option_type,
-            'debit':       debit,
+            'debit':       order_debit,   # real market mid (far_mid - near_mid); used for DB entry price
+            'est_debit':   debit,         # original price×0.015 estimate — kept for logging only
             'contracts':   contracts,
             'dry_run':     dry_run,
         }

@@ -33,7 +33,7 @@ from config import (
     DTE_MIN, DTE_MAX, DTE_SWEET_SPOT, DTE_EXIT,
     PROFIT_TARGET_CREDIT, PROFIT_TARGET_DEBIT, PROFIT_TARGET_CALENDAR,
     LOSS_STOP_MULTIPLIER, DEBIT_HARD_STOP_PCT, CAL_HARD_STOP_PCT,
-    CAL_DTE_FRONT, CAL_DTE_BACK, CAL_IV_MAX,
+    CAL_DTE_FRONT, CAL_DTE_BACK,
     CAL_IVR_MIN, CAL_VIX_OVERRIDE, CAL_BLACKLIST, CAL_MAX_OPEN,
     CREDIT_MIN_RATIO, EMA_TREND_PERIOD,
     KILL_SWITCH, REAL_BALANCE,
@@ -419,14 +419,9 @@ async def fetch_earnings_cache(tt_metrics=None):
 # ── Option Chain — Find Target Strike ──────────────────────────────
 
 def _min_credit_for_price(price):
-    if price < 20:
-        return 0.10
-    elif price < 50:
-        return 0.20
-    elif price < 100:
-        return 0.40
-    else:
-        return 0.75
+    """Minimum bid to confirm a tradeable market exists (0.10% of price, floor $0.05).
+    Credit quality is enforced downstream by the credit ratio gate in build_order."""
+    return max(0.05, round(price * 0.001, 2))
 
 
 def _find_strike(option_type, price, options, greeks_data, iv_frac, T, r, em_dollar):
@@ -516,8 +511,12 @@ async def get_options_data(symbol, vix_dir='unknown', vix_value=20.0, tt_cache=N
         if tt_cache and 'history' in tt_cache:
             hist = tt_cache['history'].get(symbol)
         if hist is None:
-            h_dict = await tt.tt_prefetch_history([symbol], days=60)
-            hist   = h_dict.get(symbol)
+            try:
+                h_dict = await asyncio.wait_for(tt.tt_prefetch_history([symbol], days=60), timeout=45)
+            except asyncio.TimeoutError:
+                log.warning(f'SKIP {symbol}: tt_prefetch_history timed out after 45s')
+                return None
+            hist = h_dict.get(symbol)
         if hist is None or hist.empty or len(hist) < 6:
             log.info(f'SKIP {symbol}: no price history from TT')
             return None
@@ -597,7 +596,13 @@ async def get_options_data(symbol, vix_dir='unknown', vix_value=20.0, tt_cache=N
 
         greeks_data = {}
         if candidate_opts:
-            greeks_data = await tt.tt_get_greeks_for_options(candidate_opts)
+            try:
+                greeks_data = await asyncio.wait_for(
+                    tt.tt_get_greeks_for_options(candidate_opts), timeout=60
+                )
+            except asyncio.TimeoutError:
+                log.warning(f'SKIP {symbol}: tt_get_greeks_for_options timed out after 60s')
+                return None
 
         def _enrich(sym_map, opt_type_str):
             result = []
@@ -1098,14 +1103,6 @@ def validate_entry(data, strategy, sub_type, earnings_cache, open_positions):
     if strategy == 'calendar_spread':
         vix_now = data.get('vix_value', 20.0)
 
-        # 2a. IV ceiling — calendars need LOW IV to enter; high IV has more room to collapse
-        avg_iv = data.get('avg_iv', 0.0)
-        if avg_iv > 0 and avg_iv > CAL_IV_MAX:
-            failures.append(
-                f'Calendar IV too high: {avg_iv:.1f}% > {CAL_IV_MAX:.0f}% — IV must be low to buy vol cheap'
-            )
-            return False, failures
-
         # 2b. IVR floor
         if ivr < CAL_IVR_MIN:
             failures.append(f'Calendar IVR floor: IVR {ivr:.0f}% < {CAL_IVR_MIN:.0f}% minimum')
@@ -1205,6 +1202,7 @@ def build_signal(data, strategy, sub_type, balance, call_spread_width=5.0):
         'sector':       data.get('sector', 'Unknown'),
         'dte_exit':     DTE_EXIT,
         'roll_pop_floor': ROLL_POP_FLOOR,
+        'balance':      balance,   # passed through for debit spread resizing
     }
 
     if strategy in ('put_credit_spread', 'jade_lizard', 'iron_condor'):
@@ -1821,7 +1819,15 @@ def build_debit_spread(data, signal):
         log.info(f'{symbol}: build_debit_spread — zero or negative net debit')
         return None
 
-    contracts  = signal.get('contracts', 1)
+    # Recalculate contracts using the real net_debit as BPR.
+    # build_signal estimated BPR as price×2% which can be wildly off for near-ATM spreads.
+    _balance        = signal.get('balance', 5000)
+    bpr_per_ct      = net_debit * 100
+    contracts       = calculate_size(_balance, bpr_per_ct)
+    if contracts == 0:
+        log.info(f'{symbol}: build_debit_spread — BPR gate: net_debit ${net_debit:.2f} too expensive')
+        return None
+    log.info(f'{symbol}: debit spread sizing — real debit ${net_debit:.2f} × {contracts}ct = ${bpr_per_ct * contracts:.0f} BPR ({bpr_per_ct * contracts / _balance * 100:.1f}%)')
     max_loss   = round(net_debit * 100 * contracts, 2)
     max_profit = round((wing_width - net_debit) * 100 * contracts, 2)
 
@@ -3569,8 +3575,10 @@ async def run_scan():
     metrics = {}
     history = {}
     try:
-        spots = await tt.tt_get_spot_batch(symbols)
+        spots = await asyncio.wait_for(tt.tt_get_spot_batch(symbols), timeout=60)
         log.info(f'Spot prefetch: {len(spots)}/{len(symbols)} symbols')
+    except asyncio.TimeoutError:
+        log.warning('Spot prefetch timed out after 60s — continuing without spots')
     except Exception as e:
         log.warning(f'Spot prefetch failed: {str(e)[:60]}')
     try:
@@ -3578,11 +3586,19 @@ async def run_scan():
         log.info(f'Metrics prefetch: {len(metrics)}/{len(symbols)} symbols')
     except Exception as e:
         log.warning(f'Metrics prefetch failed: {str(e)[:60]}')
-    try:
-        history = await tt.tt_prefetch_history(symbols, days=60)
-        log.info(f'History prefetch: {len(history)}/{len(symbols)} symbols')
-    except Exception as e:
-        log.warning(f'History prefetch failed: {str(e)[:60]}')
+    # History: chunked 15-at-a-time — 123 symbols at once returns 0 (server limit)
+    _HIST_CHUNK = 15
+    for _i in range(0, len(symbols), _HIST_CHUNK):
+        _chunk = symbols[_i:_i + _HIST_CHUNK]
+        try:
+            _h = await asyncio.wait_for(tt.tt_prefetch_history(_chunk, days=60), timeout=60)
+            history.update(_h)
+            log.info(f'History chunk {_i // _HIST_CHUNK + 1}: {len(_h)}/{len(_chunk)} symbols')
+        except asyncio.TimeoutError:
+            log.warning(f'History chunk {_i // _HIST_CHUNK + 1} timed out — skipping')
+        except Exception as e:
+            log.warning(f'History chunk {_i // _HIST_CHUNK + 1} failed: {str(e)[:60]}')
+    log.info(f'History prefetch total: {len(history)}/{len(symbols)} symbols')
 
     tt_cache = {'spots': spots, 'metrics': metrics, 'history': history}
 
@@ -3601,17 +3617,45 @@ async def run_scan():
 
     traded_today = db.symbols_today()
 
+    # ── Prefetch quality + context report ─────────────────────────────
+    _n = len(symbols)
+    _vix_val = vix_data.get('vix', '?') if vix_data else '?'
+    _vix_dir = vix_data.get('vix_dir', 'unknown') if vix_data else 'unknown'
+    _vix_arrow = {'rising': '↑', 'falling': '↓'}.get(_vix_dir, '→')
+    _already_traded = len([s for s in symbols if s in traded_today])
+    _today = date.today()
+    _earnings_blocked = sum(
+        1 for s in symbols
+        if earnings_cache.get(s) and
+        0 <= (date.fromisoformat(earnings_cache[s]) - _today).days <= EARNINGS_BLOCK
+    )
+    _prefetch_line = (
+        f'📡 Prefetch: spots {len(spots)}/{_n} | metrics {len(metrics)}/{_n} | history {len(history)}/{_n}\n'
+        f'VIX: {_vix_val} {_vix_arrow} {_vix_dir} | Already traded today: {_already_traded} | '
+        f'Earnings blocked (≤{EARNINGS_BLOCK}d): {_earnings_blocked}'
+    )
+    await tg(_prefetch_line)
+
     # Snapshot max trade ID before scan — used to find newly placed trades at the end
     with db.get_conn() as _c:
         _row = _c.execute("SELECT COALESCE(MAX(id), 0) FROM trades").fetchone()
         pre_scan_id = int(_row[0])
 
     placed      = 0
-    skipped     = 0
     errors      = 0
     open_now    = open_count
     ai_reasons    = {}   # symbol → ai_reason for post-scan TG block
     strat_reasons = {}   # symbol → strat_reason for post-scan TG block
+    sk = {                # named skip buckets
+        'traded_today': _already_traded,  # pre-counted above
+        'no_data':      0,   # get_options_data returned None
+        'strategy':     0,   # IVR/bias → no valid strategy
+        'validation':   0,   # validate_entry failed
+        'sector':       0,   # sector concentration cap
+        'ai_block':     0,   # Grok screener blocked
+        'build':        0,   # build_signal / build_order failed
+        'capital':      0,   # capital ceiling hit mid-scan
+    }
 
     for symbol in symbols:
         if open_now >= MAX_POSITIONS:
@@ -3619,7 +3663,7 @@ async def run_scan():
             break
 
         if symbol in traded_today:
-            skipped += 1
+            # already counted in sk['traded_today'] pre-scan
             continue
 
         try:
@@ -3627,7 +3671,7 @@ async def run_scan():
                                           vix_value=(vix_data.get('vix', 20.0) if vix_data else 20.0),
                                           tt_cache=tt_cache)
             if data is None:
-                skipped += 1
+                sk['no_data'] += 1
                 continue
 
             strategy, sub_type, strat_reason = select_strategy(
@@ -3635,20 +3679,20 @@ async def run_scan():
             )
             if strategy == 'skip' or strategy is None:
                 log.info(f'SKIP {symbol}: {strat_reason}')
-                skipped += 1
+                sk['strategy'] += 1
                 continue
 
             open_pos_list = [dict(t) for t in open_trades]
             ok, val_failures = validate_entry(data, strategy, sub_type, earnings_cache, open_pos_list)
             if not ok:
                 log.info(f'SKIP {symbol} ({strategy}): {val_failures}')
-                skipped += 1
+                sk['validation'] += 1
                 continue
 
             sector = data.get('sector', 'Unknown')
             if sector_counts.get(sector, 0) >= MAX_SECTOR_POSITIONS:
                 log.info(f'SKIP {symbol}: sector gate ({sector} has {sector_counts[sector]} positions)')
-                skipped += 1
+                sk['sector'] += 1
                 continue
 
             call_spread_width = 5.0
@@ -3663,7 +3707,7 @@ async def run_scan():
 
             signal = build_signal(data, strategy, sub_type, balance, call_spread_width)
             if signal is None:
-                skipped += 1
+                sk['build'] += 1
                 continue
 
             # ── AI catalyst screener (hard block) ──────────────────
@@ -3671,7 +3715,7 @@ async def run_scan():
             if not ai_proceed:
                 log.info(f'SKIP {symbol}: AI screen BLOCK — {ai_reason}')
                 await tg(f'🤖 *AI blocked* {symbol} {strategy}\n_{ai_reason}_')
-                skipped += 1
+                sk['ai_block'] += 1
                 continue
             signal['ai_reason'] = ai_reason
 
@@ -3682,14 +3726,14 @@ async def run_scan():
                 )
                 if not far_list:
                     log.info(f'SKIP {symbol}: no far expiry for calendar (DTE {CAL_DTE_BACK})')
-                    skipped += 1
+                    sk['build'] += 1
                     continue
                 signal['_cal_far_expiry_list'] = far_list
 
             order = build_order(data, signal)
             if order is None or order.get('error'):
                 log.info(f'SKIP {symbol}: build_order failed — {order.get("error") if order else "None"}')
-                skipped += 1
+                sk['build'] += 1
                 continue
 
             # Calendar spread: populate near/far expiry from data + far_list into order.
@@ -3699,7 +3743,7 @@ async def run_scan():
                 far_list_resolved = signal.get('_cal_far_expiry_list', [])
                 if not far_list_resolved:
                     log.info(f'SKIP {symbol}: calendar far_list empty after build_order')
-                    skipped += 1
+                    sk['build'] += 1
                     continue
                 far_str = far_list_resolved[0][0]   # (expiry_str, dte, options) tuple
                 order['near_expiry'] = near_str
@@ -3712,7 +3756,7 @@ async def run_scan():
             can_trade_now, guard_now = db.check_guardrails()
             if not can_trade_now:
                 log.info(f'SKIP {symbol}: capital ceiling hit mid-scan — {guard_now}')
-                skipped += 1
+                sk['capital'] += 1
                 continue
 
             success = await _execute_signal(order, signal, data, dry_run=dry_run)
@@ -3734,12 +3778,23 @@ async def run_scan():
             log.error(f'Scan error {symbol}: {e}', exc_info=True)
             errors += 1
 
+    _sk_total = sum(sk.values())
     summary = (
-        f'✅ *Scan complete* — {placed} placed | {skipped} skipped | {errors} errors\n'
-        f'Balance: ${balance:,.2f} | Positions: {open_now}/{MAX_POSITIONS}'
+        f'✅ *Scan complete* — {placed} placed | {_sk_total} skipped | {errors} errors\n'
+        f'Balance: ${balance:,.2f} | Positions: {open_now}/{MAX_POSITIONS}\n\n'
+        f'*Skip breakdown ({_sk_total}):*\n'
+        f'  No data: {sk["no_data"]} | No IVR: {sk["strategy"]} | Validation: {sk["validation"]}\n'
+        f'  Sector cap: {sk["sector"]} | AI blocked: {sk["ai_block"]} | Build fail: {sk["build"]}\n'
+        f'  Traded today: {sk["traded_today"]} | Capital cap: {sk["capital"]}'
     )
     await tg(summary)
-    log.info(f'=== SCAN END: {placed} placed, {skipped} skipped, {errors} errors ===')
+    log.info(
+        f'=== SCAN END: {placed} placed, {_sk_total} skipped '
+        f'(no_data={sk["no_data"]} no_ivr={sk["strategy"]} validation={sk["validation"]} '
+        f'sector={sk["sector"]} ai={sk["ai_block"]} build={sk["build"]} '
+        f'traded_today={sk["traded_today"]} capital={sk["capital"]}), '
+        f'{errors} errors ==='
+    )
 
     # Send new trades block — one HTML message listing every trade opened this scan
     if placed > 0:
