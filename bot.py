@@ -83,6 +83,27 @@ def bs_prob_otm(S, K, T, r, sigma, option_type):
     return round(norm.cdf(-d2) * 100 if option_type == 'call' else norm.cdf(d2) * 100, 1)
 
 
+# ── BS Greeks ──────────────────────────────────────────────────────
+
+def bs_greeks(S, K, T, r, sigma, option_type):
+    """Return (delta, gamma, theta_per_day, vega_per_1pct) for one option leg."""
+    if T <= 0 or sigma <= 0:
+        return 0.0, 0.0, 0.0, 0.0
+    d1 = (math.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
+    d2 = d1 - sigma * math.sqrt(T)
+    npdf = math.exp(-0.5 * d1 ** 2) / math.sqrt(2 * math.pi)
+    delta = norm.cdf(d1) if option_type == 'call' else norm.cdf(d1) - 1
+    gamma = npdf / (S * sigma * math.sqrt(T))
+    if option_type == 'call':
+        theta = (-(S * npdf * sigma / (2 * math.sqrt(T)))
+                 - r * K * math.exp(-r * T) * norm.cdf(d2)) / 365
+    else:
+        theta = (-(S * npdf * sigma / (2 * math.sqrt(T)))
+                 + r * K * math.exp(-r * T) * norm.cdf(-d2)) / 365
+    vega = S * npdf * math.sqrt(T) / 100
+    return round(delta, 3), round(gamma, 4), round(theta, 3), round(vega, 3)
+
+
 # ── Expected Move ──────────────────────────────────────────────────
 
 def expected_move(price, iv_pct, dte):
@@ -744,18 +765,9 @@ def select_strategy(ivr_regime, bias, data):
             return 'iron_condor', '', f'MEDIUM IVR ({data["ivr"]:.0f}%) + NEUTRAL → iron condor'
 
     elif ivr_regime == 'LOW':
-        if move_5d <= -BIAS_MOVE_THRESHOLD * 100:
-            return 'debit_spread', 'call', (
-                f'LOW IVR ({data["ivr"]:.0f}%) + stock down {move_5d:.1f}% → call debit spread'
-            )
-        elif move_5d >= BIAS_MOVE_THRESHOLD * 100:
-            return 'debit_spread', 'put', (
-                f'LOW IVR ({data["ivr"]:.0f}%) + stock up +{move_5d:.1f}% → put debit spread'
-            )
-        else:
-            return 'calendar_spread', '', (
-                f'LOW IVR ({data["ivr"]:.0f}%) + stock flat → calendar spread (IV expansion bet)'
-            )
+        return 'skip', '', (
+            f'LOW IVR ({data["ivr"]:.0f}%) — insufficient premium, sitting in cash'
+        )
     else:
         return 'skip', '', 'IVR unavailable or unclassified — SKIP'
 
@@ -963,10 +975,9 @@ def _grok_call(prompt: str) -> dict | None:
 
 
 def grok_screen(signal: dict) -> tuple:
-    """AI catalyst screener — hard block gate.
+    """AI catalyst screener — advisory only (does not block trades).
     Queries Grok with web_search for real-time catalyst risk.
-    Returns (proceed: bool, reason: str).
-    Fails OPEN — if Grok is unavailable the trade proceeds."""
+    Returns (proceed: bool, reason: str) — always proceeds, BLOCK is logged as warning."""
     symbol   = signal.get('symbol', '?')
     strategy = signal.get('strategy', '?')
 
@@ -989,7 +1000,8 @@ def grok_screen(signal: dict) -> tuple:
         log.info(f'AI screen {symbol}: {verdict} — {reason}')
 
         if verdict == 'BLOCK':
-            return False, reason
+            # Advisory only — log the concern but do not block the trade
+            log.warning(f'AI screen {symbol}: BLOCK advisory (proceeding anyway) — {reason}')
         return True, reason
 
     except Exception as e:
@@ -2583,9 +2595,10 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         'ACCOUNT\n'
         '/status    — bot state + guardrails\n'
         '/balance   — fetch live TT NLV\n'
-        '/pause     — halt new entries\n'
-        '/resume    — re-enable entries\n'
-        '/mode      — show or set mode (paper/live)\n\n'
+        '/pause        — halt new entries\n'
+        '/resume       — re-enable entries\n'
+        '/reset_losses — clear consecutive loss counter\n'
+        '/mode         — show or set mode (paper/live)\n\n'
         'EXIT RULES\n'
         '25% profit  → auto close\n'
         '50% loss    → hard stop\n'
@@ -2832,6 +2845,19 @@ async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f'▶️ Pause cleared, but still blocked:\n`{reason}`', parse_mode='Markdown'
         )
+
+
+async def cmd_reset_losses(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _authed(update):
+        return await _deny(update)
+    db.set_state('consecutive_losses', '0')
+    db.set_state('consecutive_wins',   '0')
+    log.info('Consecutive loss counter reset via /reset_losses')
+    can_trade, reason = db.check_guardrails()
+    status = '✅ Trading unblocked' if can_trade else f'⚠️ Still blocked: `{reason}`'
+    await update.message.reply_text(
+        f'🔄 *Consecutive loss counter reset.*\n{status}', parse_mode='Markdown'
+    )
 
 
 async def cmd_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3819,6 +3845,282 @@ async def run_scan():
             log.warning(f'New trades block failed: {e}')
 
 
+# ── Daily Position Recap ────────────────────────────────────────────
+
+def _recap_strikes(trade):
+    """Return strike structure string and short-leg info for a trade."""
+    strat = trade.get('strategy', '')
+    exp   = trade.get('expiry', '')
+    sp    = trade.get('sell_strike') or 0
+    bp    = trade.get('buy_strike')  or 0
+    spp   = trade.get('sell_strike_put') or 0
+    bpp   = trade.get('buy_strike_put')  or 0
+
+    if strat == 'iron_condor':
+        line  = f'Puts: ${spp}/${bpp} | Calls: ${sp}/${bp} | Exp: {exp}'
+        short_put  = float(spp)
+        short_call = float(sp)
+        return line, short_put, short_call
+    if strat == 'call_credit_spread':
+        line = f'Strikes: ${sp}/${bp} | Exp: {exp}'
+        return line, None, float(sp)
+    if strat == 'jade_lizard':
+        sc = trade.get('sell_call') or sp
+        line = f'Put: ${spp}/${bpp} | Call: ${sc} | Exp: {exp}'
+        return line, float(spp), None
+    # put_credit_spread / debit_spread / default
+    line = f'Strikes: ${sp}/${bp} | Exp: {exp}'
+    return line, float(sp), None
+
+
+def _recap_pop_entry(trade):
+    """Estimate POP at entry from stored entry_delta or BS."""
+    entry_delta = trade.get('entry_delta')
+    if entry_delta is not None:
+        strat = trade.get('strategy', '')
+        if strat == 'iron_condor':
+            # entry_delta stored for put leg; we only have one side — rough estimate
+            return round((1 - abs(float(entry_delta))) * 100, 1)
+        return round((1 - abs(float(entry_delta))) * 100, 1)
+    # Fallback: compute from entry conditions
+    S     = float(trade.get('spot_price') or 0)
+    K     = float(trade.get('sell_strike') or trade.get('sell_strike_put') or 0)
+    dte   = int(trade.get('dte_at_open') or 0)
+    iv    = float(trade.get('entry_iv') or 0)
+    strat = trade.get('strategy', '')
+    if S <= 0 or K <= 0 or dte <= 0 or iv <= 0:
+        return None
+    opt = 'call' if 'call' in strat else 'put'
+    return bs_prob_otm(S, K, dte / 365, 0.05, iv / 100, opt)
+
+
+def _recap_pop_now(trade, spot, iv_now, dte_now):
+    """Compute current POP from live spot/IV/DTE."""
+    if not spot or not iv_now or not dte_now:
+        return None
+    strat = trade.get('strategy', '')
+    r     = 0.05
+    T     = dte_now / 365
+    sigma = iv_now / 100
+
+    if strat == 'iron_condor':
+        sp = float(trade.get('sell_strike_put') or 0)
+        sc = float(trade.get('sell_strike') or 0)
+        if sp <= 0 or sc <= 0:
+            return None
+        pop = min(bs_prob_otm(spot, sp, T, r, sigma, 'put'),
+                  bs_prob_otm(spot, sc, T, r, sigma, 'call'))
+    elif strat == 'call_credit_spread':
+        K = float(trade.get('sell_strike') or 0)
+        if K <= 0:
+            return None
+        pop = bs_prob_otm(spot, K, T, r, sigma, 'call')
+    elif strat == 'jade_lizard':
+        sp = float(trade.get('sell_strike_put') or 0)
+        if sp <= 0:
+            return None
+        pop = bs_prob_otm(spot, sp, T, r, sigma, 'put')
+    else:
+        K = float(trade.get('sell_strike') or 0)
+        if K <= 0:
+            return None
+        pop = bs_prob_otm(spot, K, T, r, sigma, 'put')
+    return round(pop, 1)
+
+
+def _recap_greeks(trade, spot, iv_now, dte_now):
+    """Compute current BS greeks for the short leg."""
+    if not spot or not iv_now or not dte_now:
+        return None
+    strat  = trade.get('strategy', '')
+    T      = dte_now / 365
+    r      = 0.05
+    sigma  = iv_now / 100
+    opt    = 'call' if strat == 'call_credit_spread' else 'put'
+    K      = float(trade.get('sell_strike_put') or trade.get('sell_strike') or 0)
+    if K <= 0:
+        return None
+    return bs_greeks(spot, K, T, r, sigma, opt)
+
+
+def _recap_buffer(trade, spot):
+    """Return buffer string: distance from spot to each short strike."""
+    if not spot:
+        return 'N/A'
+    strat = trade.get('strategy', '')
+    if strat == 'iron_condor':
+        sp = float(trade.get('sell_strike_put') or 0)
+        sc = float(trade.get('sell_strike') or 0)
+        put_buf  = round(spot - sp, 2)
+        call_buf = round(sc - spot, 2)
+        put_pct  = round(put_buf / spot * 100, 1) if spot else 0
+        call_pct = round(call_buf / spot * 100, 1) if spot else 0
+        return f'Put ${put_buf} ({put_pct}%) | Call ${call_buf} ({call_pct}%)'
+    elif strat == 'call_credit_spread':
+        sc = float(trade.get('sell_strike') or 0)
+        buf = round(sc - spot, 2)
+        pct = round(buf / spot * 100, 1) if spot else 0
+        return f'${buf} ({pct}%) above spot'
+    elif strat == 'jade_lizard':
+        sp = float(trade.get('sell_strike_put') or 0)
+        buf = round(spot - sp, 2)
+        pct = round(buf / spot * 100, 1) if spot else 0
+        return f'${buf} ({pct}%) below spot'
+    else:
+        sp = float(trade.get('sell_strike') or 0)
+        buf = round(spot - sp, 2)
+        pct = round(buf / spot * 100, 1) if spot else 0
+        return f'${buf} ({pct}%) below spot'
+
+
+async def _build_recap_msg(trade, earnings_cache):
+    """Fetch live data and build the recap message for one trade."""
+    symbol    = trade['symbol']
+    strategy  = trade['strategy']
+    credit    = float(trade.get('credit_debit') or 0)
+    contracts = int(trade.get('contracts') or 1)
+    max_loss  = float(trade.get('max_loss') or 0)
+    ivr_entry = trade.get('ivr')
+    expiry    = trade.get('expiry', '')
+    is_debit  = 'debit' in strategy or 'calendar' in strategy
+
+    today = date.today()
+    exp_date = date.fromisoformat(expiry) if expiry else None
+    dte_now  = (exp_date - today).days if exp_date else None
+
+    # ── Live data ──────────────────────────────────────────────────
+    spot = None
+    try:
+        spot = await _get_spot(symbol)
+    except Exception:
+        spot = trade.get('last_spot_price')
+
+    iv_now, ivr_now = None, None
+    try:
+        _m = (await tt.tt_get_metrics_batch([symbol])).get(symbol)
+        if _m:
+            if _m.implied_volatility_30_day:
+                iv_now = round(float(_m.implied_volatility_30_day) * 100, 1)
+            elif _m.implied_volatility_index:
+                _raw = float(_m.implied_volatility_index)
+                iv_now = round(_raw if _raw > 2 else _raw * 100, 1)
+            if _m.implied_volatility_index_rank is not None:
+                ivr_now = round(float(_m.implied_volatility_index_rank) * 100, 1)
+    except Exception:
+        pass
+
+    # ── P&L ───────────────────────────────────────────────────────
+    last_val = trade.get('last_spread_value')
+    pnl_str  = 'N/A'
+    if last_val is not None:
+        cv = float(last_val)
+        cr = abs(credit)
+        pnl = round((cr - cv) * 100 * contracts, 2) if not is_debit else round((cv - cr) * 100 * contracts, 2)
+        pnl_pct = round(abs(pnl / (max_loss * contracts)) * 100, 1) if max_loss else 0
+        sign = '+' if pnl >= 0 else ''
+        pnl_str = f'{sign}${pnl:.0f} ({sign}{pnl_pct:.1f}% of max loss)'
+
+    # ── POP ───────────────────────────────────────────────────────
+    pop_entry = _recap_pop_entry(trade)
+    pop_now   = _recap_pop_now(trade, spot, iv_now, dte_now)
+
+    pop_line  = 'N/A'
+    if pop_now is not None:
+        pop_line = f'{pop_now}%'
+        if pop_entry is not None:
+            pop_line += f' [was {pop_entry}% at entry]'
+
+    # ── Greeks ────────────────────────────────────────────────────
+    greeks_line = 'N/A'
+    g = _recap_greeks(trade, spot, iv_now, dte_now)
+    if g:
+        d, gam, th, v = g
+        greeks_line = f'δ {d}  γ {gam}  θ {th}/day  ν {v}  IV {iv_now or "?"}%'
+
+    # ── EM remaining ──────────────────────────────────────────────
+    em_line = 'N/A'
+    if iv_now and dte_now and spot:
+        em_d, em_p = expected_move(spot, iv_now, dte_now)
+        em_line = f'±{em_p}% (${em_d:.2f})'
+
+    # ── Trigger ───────────────────────────────────────────────────
+    trigger_line = 'No upcoming events'
+    if earnings_cache and symbol in earnings_cache:
+        try:
+            ed = date.fromisoformat(earnings_cache[symbol])
+            days = (ed - today).days
+            if 0 <= days <= 30:
+                trigger_line = f'Earnings in {days}d ({earnings_cache[symbol]})'
+        except Exception:
+            pass
+
+    # ── Format ───────────────────────────────────────────────────
+    strat_names = {
+        'put_credit_spread':  'Put Credit Spread',
+        'call_credit_spread': 'Call Credit Spread',
+        'iron_condor':        'Iron Condor',
+        'jade_lizard':        'Jade Lizard',
+        'debit_spread':       'Debit Spread',
+        'calendar_spread':    'Calendar Spread',
+    }
+    strat_label = strat_names.get(strategy, strategy.replace('_', ' ').title())
+    strikes_line, _, _ = _recap_strikes(trade)
+    buf_line  = _recap_buffer(trade, spot)
+    now_str   = datetime.now(ET).strftime('%Y-%m-%d %H:%M ET')
+    credit_per = round(abs(credit) * 100, 2)
+    ivr_entry_str = f'{ivr_entry:.1f}%' if ivr_entry is not None else 'N/A'
+    ivr_now_str   = f'{ivr_now:.1f}%' if ivr_now is not None else 'N/A'
+    spot_str  = f'${spot:.2f}' if spot else 'N/A'
+    dte_str   = str(dte_now) if dte_now is not None else 'N/A'
+
+    msg = (
+        f'📊 *[LIVE] POSITION REVIEW — {symbol}*\n'
+        f'{now_str} | DTE: {dte_str}\n'
+        f'\n--- TRADE ---\n'
+        f'{strat_label}\n'
+        f'{strikes_line}\n'
+        f'Credit received: ${credit_per}/contract\n'
+        f'Contracts: {contracts} | Max loss: ${max_loss:.0f} | IVR at entry: {ivr_entry_str}\n'
+        f'\n--- NOW ---\n'
+        f'Spot       : {spot_str}\n'
+        f'Buffer     : {buf_line}\n'
+        f'Prob OTM   : {pop_line}\n'
+        f'P&L        : {pnl_str}\n'
+        f'Greeks     : {greeks_line}\n'
+        f'IVR: {ivr_now_str} | EM remaining: {em_line}\n'
+        f'\n--- TRIGGER ---\n'
+        f'{trigger_line}'
+    )
+    return msg
+
+
+async def daily_recap():
+    """Send morning position recap for all open trades."""
+    trades = db.get_open_trades()
+    if not trades:
+        await tg('📊 *Daily Recap* — no open positions.')
+        return
+
+    earnings_cache = {}
+    try:
+        earnings_cache = await fetch_earnings_cache()
+    except Exception:
+        pass
+
+    for t in trades:
+        try:
+            msg = await _build_recap_msg(dict(t), earnings_cache)
+            await tg(msg)
+        except Exception as e:
+            log.warning(f'daily_recap failed for {t["symbol"]}: {str(e)[:80]}')
+
+
+async def cmd_recap(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Manual /recap — send position recap immediately."""
+    await update.message.reply_text('Generating recap...')
+    await daily_recap()
+
+
 # ── Monitor wrapper ─────────────────────────────────────────────────
 
 async def run_monitor(force: bool = False):
@@ -3844,13 +4146,15 @@ async def post_init(application):
     await application.bot.set_my_commands([
         BotCommand('scan',      'Trigger manual scan'),
         BotCommand('monitor',   'Run monitor cycle now'),
+        BotCommand('recap',     'Position review with live Greeks + P&L'),
         BotCommand('positions', 'Open positions + P&L'),
         BotCommand('history',   'Closed trade summary'),
         BotCommand('status',    'Bot state + guardrails'),
         BotCommand('balance',   'Fetch live TT NLV'),
-        BotCommand('pause',     'Halt new entries'),
-        BotCommand('resume',    'Re-enable entries'),
-        BotCommand('mode',      'Show or set mode (paper/live)'),
+        BotCommand('pause',        'Halt new entries'),
+        BotCommand('resume',       'Re-enable entries'),
+        BotCommand('reset_losses', 'Clear consecutive loss counter'),
+        BotCommand('mode',         'Show or set mode (paper/live)'),
         BotCommand('help',      'Command list'),
     ])
 
@@ -3873,10 +4177,11 @@ async def post_init(application):
 
     scheduler = AsyncIOScheduler(timezone='America/New_York')
     scheduler.add_job(sync_balance, 'cron', day_of_week='mon-fri', hour=8,  minute=0,    id='sync_balance')
+    scheduler.add_job(daily_recap,  'cron', day_of_week='mon-fri', hour=9,  minute=0,    id='daily_recap')
     scheduler.add_job(run_scan,     'cron', day_of_week='mon-fri', hour=9,  minute=45,   id='run_scan')
     scheduler.add_job(run_monitor,  'cron', day_of_week='mon-fri', hour='9-16', minute='0,30', id='run_monitor')
     scheduler.start()
-    log.info('APScheduler started: sync=08:00, scan=09:45, monitor=*/30min')
+    log.info('APScheduler started: sync=08:00, recap=09:00, scan=09:45, monitor=*/30min')
 
 
 def main():
@@ -3893,11 +4198,13 @@ def main():
     app.add_handler(CommandHandler('positions', cmd_positions))
     app.add_handler(CommandHandler('balance',   cmd_balance))
     app.add_handler(CommandHandler('scan',      cmd_scan))
-    app.add_handler(CommandHandler('pause',     cmd_pause))
-    app.add_handler(CommandHandler('resume',    cmd_resume))
-    app.add_handler(CommandHandler('mode',      cmd_mode))
+    app.add_handler(CommandHandler('pause',        cmd_pause))
+    app.add_handler(CommandHandler('resume',       cmd_resume))
+    app.add_handler(CommandHandler('reset_losses', cmd_reset_losses))
+    app.add_handler(CommandHandler('mode',         cmd_mode))
     app.add_handler(CommandHandler('monitor',   cmd_monitor))
     app.add_handler(CommandHandler('history',   cmd_history))
+    app.add_handler(CommandHandler('recap',     cmd_recap))
 
     log.info('Kubera starting...')
     app.run_polling(drop_pending_updates=True)

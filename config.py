@@ -53,7 +53,7 @@ DTE_EXIT          = 21     # time-based exit: close position before this DTE
 # Short strike is placed at TARGET_DELTA; wing is sized by expected move.
 # ═══════════════════════════════════════════════════════════════════
 
-TARGET_DELTA      = 0.10   # short strike delta — 10 delta ≈ 90% POP (further OTM, max POP)
+TARGET_DELTA      = 0.16   # short strike delta — 16 delta ≈ 84% POP (1 SD, TT canonical)
 MIN_POP           = 0.67   # minimum probability of profit to enter any trade
                             # TT: 1/3-width credit rule → ~67% POP minimum
 
@@ -216,7 +216,7 @@ MAX_CAPITAL_DEPLOYED   = 0.50   # no new entries when deployed ≥ 50% of balanc
 EARNINGS_BLOCK         = 7      # no new entries within 7 days of earnings announcement
                                  # TastyTrade: earnings plays are closed the open after the announcement
                                  # For premium selling, avoid being in the position through earnings
-MIN_OPTION_OI          = 300    # minimum open interest on the short strike — liquidity gate
+MIN_OPTION_OI          = 100    # minimum open interest on the short strike — liquidity gate
 MAX_SPREAD_PCT         = 40.0   # max bid-ask spread as % of mid — fill quality gate
 CONSEC_LOSS_PAUSE      = 3      # pause entries after 3 consecutive losses — reassess conditions
 
